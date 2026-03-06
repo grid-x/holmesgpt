@@ -54,6 +54,16 @@ def get_context_window_compaction_threshold_pct() -> int:
 ROBUSTA_AI_MODEL_NAME = "Robusta"
 
 
+def _messages_contain_tool_content(messages: List[Dict[str, Any]]) -> bool:
+    """Check if messages contain tool-related content (tool messages or tool_calls)."""
+    for message in messages:
+        if message.get("role") == "tool":
+            return True
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            return True
+    return False
+
+
 class TokenCountMetadata(BaseModel):
     total_tokens: int
     tools_tokens: int
@@ -220,8 +230,13 @@ class DefaultLLM(LLM):
                     "https://docs.litellm.ai/docs/providers/watsonx#usage---models-in-deployment-spaces"
                 )
         elif provider == "bedrock":
-            if os.environ.get("AWS_PROFILE") or os.environ.get(
-                "AWS_BEARER_TOKEN_BEDROCK"
+            # Check for IRSA (IAM Roles for Service Accounts) - AWS_WEB_IDENTITY_TOKEN_FILE
+            # Check for AWS Profile or Bearer Token
+            # Check for explicit credentials in args
+            if (
+                os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE")
+                or os.environ.get("AWS_PROFILE")
+                or os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
             ):
                 model_requirements = {"keys_in_environment": True, "missing_keys": []}
             elif args.get("aws_access_key_id") and args.get("aws_secret_access_key"):
@@ -408,27 +423,40 @@ class DefaultLLM(LLM):
         # Get the litellm module to use (wrapped or unwrapped)
         litellm_to_use = self.tracer.wrap_llm(litellm) if self.tracer else litellm
 
-        litellm_model_name = self.get_litellm_corrected_name_for_robusta_ai()
-        result = litellm_to_use.completion(
-            model=litellm_model_name,
-            api_key=self.api_key,
-            base_url=self.api_base,
-            api_version=self.api_version,
-            messages=messages,
-            response_format=response_format,
-            drop_params=drop_params,
-            allowed_openai_params=allowed_openai_params,
-            stream=stream,
-            timeout=LLM_REQUEST_TIMEOUT,
-            **tools_args,
-            **self.args,
-            cache_control_injection_points=[
-                {
-                    "location": "message",
-                    "index": -1,  # -1 targets the last message.
-                }
-            ],
+        # Handle Bedrock case: when tools=None but messages contain tool content,
+        # temporarily set modify_params=True to add a dummy tool definition
+        original_modify_params = litellm.modify_params
+        needs_modify_params = (
+            not tools_args and _messages_contain_tool_content(messages)
         )
+        if needs_modify_params:
+            litellm.modify_params = True
+
+        try:
+            litellm_model_name = self.get_litellm_corrected_name_for_robusta_ai()
+            result = litellm_to_use.completion(
+                model=litellm_model_name,
+                api_key=self.api_key,
+                base_url=self.api_base,
+                api_version=self.api_version,
+                messages=messages,
+                response_format=response_format,
+                drop_params=drop_params,
+                allowed_openai_params=allowed_openai_params,
+                stream=stream,
+                timeout=LLM_REQUEST_TIMEOUT,
+                **tools_args,
+                **self.args,
+                cache_control_injection_points=[
+                    {
+                        "location": "message",
+                        "index": -1,  # -1 targets the last message.
+                    }
+                ],
+            )
+        finally:
+            if needs_modify_params:
+                litellm.modify_params = original_modify_params
 
         if isinstance(result, ModelResponse):
             return result
@@ -678,9 +706,53 @@ def get_llm_usage(
         and hasattr(llm_response, "usage")
         and llm_response.usage
     ):  # type: ignore
-        usage["prompt_tokens"] = llm_response.usage.prompt_tokens  # type: ignore
-        usage["completion_tokens"] = llm_response.usage.completion_tokens  # type: ignore
-        usage["total_tokens"] = llm_response.usage.total_tokens  # type: ignore
+        usage_obj = llm_response.usage  # type: ignore
+
+        # Basic token counts
+        usage["prompt_tokens"] = getattr(usage_obj, "prompt_tokens", 0)
+        usage["completion_tokens"] = getattr(usage_obj, "completion_tokens", 0)
+        usage["total_tokens"] = getattr(usage_obj, "total_tokens", 0)
+
+        # Bedrock/Anthropic cache metrics
+        # Try multiple possible field names since different providers use different conventions:
+        # - Bedrock: cacheReadInputTokens, cacheWriteInputTokens
+        # - LiteLLM might normalize these to: cache_read_input_tokens, cache_write_input_tokens
+        # - Or use OpenAI-compatible names: cache_read_input_tokens, cache_creation_input_tokens
+        cache_read = (
+            getattr(usage_obj, "cache_read_input_tokens", None)
+            or getattr(usage_obj, "cache_read_tokens", None)
+        )
+        cache_write = (
+            getattr(usage_obj, "cache_creation_input_tokens", None)
+            or getattr(usage_obj, "cache_write_input_tokens", None)
+        )
+
+        if cache_read is not None:
+            usage["cache_read_input_tokens"] = cache_read
+        if cache_write is not None:
+            usage["cache_creation_input_tokens"] = cache_write
+
+        # OpenAI/Anthropic cache format (prompt_tokens_details)
+        if hasattr(usage_obj, "prompt_tokens_details") and usage_obj.prompt_tokens_details:
+            prompt_details = usage_obj.prompt_tokens_details
+            details_dict = {}
+
+            # Handle both dict and object formats
+            if isinstance(prompt_details, dict):
+                cached = prompt_details.get("cached_tokens")
+                cache_creation = prompt_details.get("cache_creation_input_tokens")
+            else:
+                cached = getattr(prompt_details, "cached_tokens", None)
+                cache_creation = getattr(prompt_details, "cache_creation_input_tokens", None)
+
+            if cached is not None:
+                details_dict["cached_tokens"] = cached
+            if cache_creation is not None:
+                details_dict["cache_creation_input_tokens"] = cache_creation
+
+            if details_dict:
+                usage["prompt_tokens_details"] = details_dict
+
     elif isinstance(llm_response, CustomStreamWrapper):
         complete_response = litellm.stream_chunk_builder(chunks=llm_response)  # type: ignore
         if complete_response:

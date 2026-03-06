@@ -41,7 +41,6 @@ RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
     echo "Unsupported platform: $TARGETPLATFORM"; exit 1; \
     fi
 RUN chmod 777 kube-lineage
-RUN ./kube-lineage --version
 
 # Set the architecture-specific argocd URLs
 ARG ARGOCD_VERSION=v3.2.0
@@ -56,7 +55,6 @@ RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
     echo "Unsupported platform: $TARGETPLATFORM"; exit 1; \
     fi
 RUN chmod 777 argocd
-RUN ./argocd --help
 
 # Install Helm
 RUN curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
@@ -75,6 +73,8 @@ RUN if [ "${PRIVATE_PACKAGE_REGISTRY}" != "none" ]; then \
     fi \
     && poetry install --no-interaction --no-ansi --no-root
 
+# Set up awscli
+RUN pip install awscli
 
 # Final stage
 FROM python:3.11-slim-bookworm
@@ -96,6 +96,8 @@ RUN apt-get update \
     apt-transport-https \
     gnupg2 \
     tcpdump \
+    gh \
+    postgresql \
     && apt-get purge -y --auto-remove \
     && apt-get install -y --no-install-recommends libexpat1 \
     && rm -rf /var/lib/apt/lists/*
@@ -107,6 +109,12 @@ RUN cat Release.key |  gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring
     && apt-get update
 RUN apt-get install -y kubectl
 
+# Set up buildkite CLI
+RUN curl -fsSL "https://packages.buildkite.com/buildkite/cli-deb/gpgkey" | gpg --dearmor -o /etc/apt/keyrings/buildkite_cli-deb-archive-keyring.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/buildkite_cli-deb-archive-keyring.gpg] https://packages.buildkite.com/buildkite/cli-deb/any/ any main" | tee /etc/apt/sources.list.d/buildkite-buildkite-cli-deb.list \
+    && apt-get update \
+    && apt-get install -y bk \
+    && rm -rf /var/lib/apt/lists/*
 
 # Microsoft ODBC for Azure SQL. Required for azure/sql toolset
 RUN VERSION_ID=$(grep VERSION_ID /etc/os-release | cut -d '"' -f 2 | cut -d '.' -f 1) && \
@@ -125,16 +133,13 @@ RUN VERSION_ID=$(grep VERSION_ID /etc/os-release | cut -d '"' -f 2 | cut -d '.' 
 
 # Set up kube lineage
 COPY --from=builder /kube-lineage /usr/local/bin
-RUN kube-lineage --version
 
 # Set up ArgoCD
 COPY --from=builder /argocd /usr/local/bin/argocd
-RUN argocd --help
 
 # Set up Helm
 COPY --from=builder /usr/local/bin/helm /usr/local/bin/helm
 RUN chmod 555 /usr/local/bin/helm
-RUN helm version
 
 ARG AWS_DEFAULT_PROFILE
 ARG AWS_DEFAULT_REGION

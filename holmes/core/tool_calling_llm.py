@@ -191,8 +191,10 @@ def _process_cost_info(
         log_prefix: Prefix for logging messages (e.g., "LLM call", "Post-processing")
     """
     try:
+        from holmes.core.llm import get_llm_usage
+
         cost = _extract_cost_from_response(full_response)
-        usage = getattr(full_response, "usage", {})
+        usage = get_llm_usage(full_response)
 
         if usage:
             if LOG_LLM_USAGE_RESPONSE:  # shows stats on token cache usage
@@ -200,9 +202,28 @@ def _process_cost_info(
             prompt_toks = usage.get("prompt_tokens", 0)
             completion_toks = usage.get("completion_tokens", 0)
             total_toks = usage.get("total_tokens", 0)
-            cost_logger.debug(
-                f"{log_prefix} cost: ${cost:.6f} | Tokens: {prompt_toks} prompt + {completion_toks} completion = {total_toks} total"
-            )
+
+            # Build log message with cache info if available
+            log_parts = [f"{log_prefix} cost: ${cost:.6f} | Tokens: {prompt_toks} prompt"]
+
+            # Check for Bedrock cache format
+            cache_read = usage.get("cache_read_input_tokens")
+            cache_write = usage.get("cache_creation_input_tokens")
+
+            # Check for OpenAI/Anthropic cache format
+            if not cache_read and not cache_write:
+                prompt_details = usage.get("prompt_tokens_details", {})
+                cache_read = prompt_details.get("cached_tokens")
+                cache_write = prompt_details.get("cache_creation_input_tokens")
+
+            if cache_read:
+                log_parts.append(f" ({cache_read} cache read)")
+            if cache_write:
+                log_parts.append(f" ({cache_write} cache write)")
+
+            log_parts.append(f" + {completion_toks} completion = {total_toks} total")
+            cost_logger.debug("".join(log_parts))
+
             # Accumulate costs and tokens if costs object provided
             if costs:
                 costs.total_cost += cost
