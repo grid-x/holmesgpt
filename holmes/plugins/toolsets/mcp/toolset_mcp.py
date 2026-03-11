@@ -812,6 +812,20 @@ class RemoteMCPTool(Tool):
         so that the OpenAI-formatted schema sent to the LLM accurately describes
         complex parameter types (arrays, objects).
         """
+        # Some MCP servers emit a bare boolean where a subschema belongs (JSON
+        # Schema's `true`/`false` "any"/"none" shorthand), e.g. Grafana's
+        # create_alert_rule has data.items.properties.model = True. Without this
+        # guard _resolve_schema passes the bool straight through and the `"anyOf"
+        # in schema` test below raises TypeError. Fall back to an untyped string
+        # parameter, which is what the shorthand effectively means here.
+        if not isinstance(schema, dict):
+            logger.warning(
+                "Malformed MCP tool schema: expected a subschema object, got %s (%r). Treating it as a string parameter.",
+                type(schema).__name__,
+                schema,
+            )
+            return ToolParameter(description=None, type="string", required=required)
+
         schema = cls._resolve_schema(schema, root_schema)
 
         # If _resolve_schema preserved a multi-branch anyOf, parse each branch
@@ -842,7 +856,6 @@ class RemoteMCPTool(Tool):
                     }
                     or None,
                 )
-
         param_type = schema.get("type", "string")
 
         items = None
@@ -1061,7 +1074,7 @@ class RemoteMCPToolset(Toolset):
             CallablePrerequisite(callable=self.prerequisites_callable)
         ]
         # Set icon from config if specified
-        if self.icon_url is None and self.config:
+        if self.icon_url is None and isinstance(self.config, dict):
             self.icon_url = self.config.get("icon_url")
 
     @model_validator(mode="before")
