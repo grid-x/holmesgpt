@@ -98,6 +98,7 @@ RUN apt-get update \
     tcpdump \
     gh \
     postgresql \
+    redis-tools \
     && apt-get purge -y --auto-remove \
     && apt-get install -y --no-install-recommends libexpat1 \
     && rm -rf /var/lib/apt/lists/*
