@@ -63,6 +63,20 @@ RUN cd /tmp && sha256sum -c helm.gz.sha256 \
     && gunzip /tmp/helm.gz && mv /tmp/helm /helm && chmod +x /helm \
     && rm -f /tmp/helm.gz.sha256
 
+# buildkite CLI (bk) for CI/CD operations. Taken from the release tarball with
+# the upstream checksums file rather than Buildkite's apt repo (Debian-only) or
+# their .apk asset (which declares `provides: bk` on a package already named
+# bk, so apk rejects it as self-conflicting).
+ARG BUILDKITE_CLI_VERSION=3.59.1
+RUN cd /tmp \
+    && curl -fsSL -O "https://github.com/buildkite/cli/releases/download/v${BUILDKITE_CLI_VERSION}/bk_${BUILDKITE_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" \
+    && curl -fsSL -O "https://github.com/buildkite/cli/releases/download/v${BUILDKITE_CLI_VERSION}/bk_${BUILDKITE_CLI_VERSION}_checksums.txt" \
+    && grep " bk_${BUILDKITE_CLI_VERSION}_linux_${TARGETARCH}.tar.gz\$" "bk_${BUILDKITE_CLI_VERSION}_checksums.txt" | sha256sum -c - \
+    && tar xzf "bk_${BUILDKITE_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" --strip-components=1 -C / "bk_${BUILDKITE_CLI_VERSION}_linux_${TARGETARCH}/bk" \
+    && chmod +x /bk \
+    && rm -f "bk_${BUILDKITE_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" "bk_${BUILDKITE_CLI_VERSION}_checksums.txt" \
+    && /bk --version
+
 # Set up poetry
 ARG PRIVATE_PACKAGE_REGISTRY="none"
 RUN if [ "${PRIVATE_PACKAGE_REGISTRY}" != "none" ]; then \
@@ -76,6 +90,15 @@ RUN if [ "${PRIVATE_PACKAGE_REGISTRY}" != "none" ]; then \
     poetry source add --priority=primary artifactory "${PRIVATE_PACKAGE_REGISTRY}"; \
     fi \
     && poetry install --no-interaction --no-ansi --no-root --with otel
+
+# awscli for AWS operations. Installed with pip into the same venv rather than
+# via Alpine's aws-cli package, which drags in a second CPython plus ~50 py3-*
+# packages (206MB vs ~163MB here). awscli v1 vendors its own botocore under
+# awscli/botocore, so it does not disturb the boto3/botocore versions resolved
+# by poetry.lock, and its remaining deps (PyYAML/colorama/jmespath/urllib3)
+# are satisfied by the already-locked versions -- verify with `pip check` if
+# this ever starts resolving differently.
+RUN pip install --no-cache-dir awscli
 
 
 # Final stage
@@ -104,6 +127,11 @@ COPY --from=builder /venv /venv
 # correctly when a user adds them via the bash toolset's `allow` config.
 # bind-tools (dig/nslookup) + tcpdump: network/DNS troubleshooting, including the
 # dig-based API-server reachability check in the kubernetes toolset.
+#
+# gridx additions: github-cli (gh) for GitHub operations, postgresql17-client
+# for database operations, redis for redis-cli. postgresql17-client installs
+# its binaries under /usr/libexec/postgresql17 and relies on the
+# postgresql-common wrappers it depends on to expose psql/pg_dump/etc. on PATH.
 RUN apk upgrade --no-cache && apk add --no-cache \
     curl \
     jq \
@@ -119,6 +147,9 @@ RUN apk upgrade --no-cache && apk add --no-cache \
     tcpdump \
     libstdc++ \
     libgcc \
+    github-cli \
+    postgresql17-client \
+    redis \
     && apk add --no-cache \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main \
@@ -136,6 +167,10 @@ RUN argocd --help
 # Set up Helm
 COPY --from=builder /helm /usr/local/bin/helm
 RUN helm version
+
+# Set up buildkite CLI
+COPY --from=builder /bk /usr/local/bin/bk
+RUN bk --version
 
 ARG AWS_DEFAULT_PROFILE
 ARG AWS_DEFAULT_REGION
