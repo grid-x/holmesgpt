@@ -696,6 +696,153 @@ class TestValidateCommandWithFlags:
         assert result.deny_reason == DenyReason.PREFIX_NOT_IN_COMMAND
 
 
+class TestArgvFlagAwareMatching:
+    """Flag-aware (argv-based) allow matching.
+
+    Prefix matching on the raw segment text is defeated by anything the shell
+    puts before a command's verb: an option (`kubectl --context=p get`) or an
+    environment assignment (`TZ=UTC date`). These are ordinary read-only
+    commands, so they must be ALLOWED rather than routed to approval.
+    """
+
+    def _lists(self, allow, deny=None):
+        config = BashExecutorConfig(
+            builtin_allowlist="extended", allow=allow, deny=deny or []
+        )
+        return get_effective_lists(config)
+
+    @pytest.mark.parametrize(
+        "command,prefixes",
+        [
+            ("kubectl --context=staging get nodes", ["kubectl get"]),
+            # Separated form: 'staging' is the flag's VALUE, not a verb.
+            ("kubectl --context staging get nodes", ["kubectl get"]),
+            ("kubectl --context=staging version", ["kubectl version"]),
+            (
+                "kubectl -n kube-system --context=prod describe pod api-0",
+                ["kubectl describe"],
+            ),
+            (
+                "kubectl --context=staging version && kubectl --context=staging get nodes",
+                ["kubectl version", "kubectl get"],
+            ),
+            ("kubectl --context=p get pods -A | grep Crash", ["kubectl get", "grep"]),
+            # Options trailing the verbs were never the problem, but must stay fine.
+            ("kubectl get pods --context=p -o json", ["kubectl get"]),
+        ],
+    )
+    def test_options_between_command_and_verb_are_allowed(self, command, prefixes):
+        allow_list, deny_list = self._lists(["kubectl get", "grep"])
+        result = validate_command(command, prefixes, allow_list, deny_list)
+        assert result.status == ValidationStatus.ALLOWED
+
+    @pytest.mark.parametrize(
+        "command,prefixes",
+        [
+            ("TZ='Europe/Berlin' date -d @1785760851 '+%Y-%m-%d'", ["date"]),
+            ("LC_ALL=C sort -u", ["sort"]),
+            ("TZ=UTC date", ["date"]),
+        ],
+    )
+    def test_leading_env_assignment_is_allowed(self, command, prefixes):
+        """bashlex strips the assignment from argv, so the verb is visible."""
+        allow_list, deny_list = self._lists([])
+        result = validate_command(command, prefixes, allow_list, deny_list)
+        assert result.status == ValidationStatus.ALLOWED
+
+    @pytest.mark.parametrize(
+        "command,prefixes",
+        [
+            # The subsequence trap: these "contain" kubectl ... get in order, but
+            # the VERB is delete/exec, so they must never match 'kubectl get'.
+            ("kubectl delete pod get", ["kubectl get"]),
+            ("kubectl exec pod -- ls get", ["kubectl get"]),
+            # A flag's value must not be consumed as the prefix verb.
+            ("kubectl --context get delete pod x", ["kubectl get"]),
+            ("kubectl --context=p delete deployment api", ["kubectl delete"]),
+            ("kubectl --context=p apply -f x.yaml", ["kubectl apply"]),
+            ("kubectl --context=p exec -it pod -- sh", ["kubectl exec"]),
+        ],
+    )
+    def test_different_verb_is_never_allowed(self, command, prefixes):
+        """Positionals must match consecutively, so another verb cannot slip in."""
+        allow_list, deny_list = self._lists(["kubectl get"])
+        result = validate_command(command, prefixes, allow_list, deny_list)
+        assert result.status != ValidationStatus.ALLOWED
+
+    def test_hardcoded_block_still_applies_with_flags(self):
+        allow_list, deny_list = self._lists(["kubectl get"])
+        result = validate_command(
+            "sudo kubectl --context=p get nodes", ["kubectl get"], allow_list, deny_list
+        )
+        assert result.status == ValidationStatus.DENIED
+        assert result.deny_reason == DenyReason.HARDCODED_BLOCK
+
+    def test_tool_result_storage_path_prefixes_still_match(self):
+        """The auto-allowed storage prefixes are PATH-based and rely on the
+        string matcher; argv matching must not regress them."""
+        allow_list, deny_list = get_effective_lists(
+            BashExecutorConfig(builtin_allowlist="extended")
+        )
+        from holmes.common.env_vars import HOLMES_TOOL_RESULT_STORAGE_PATH
+
+        result = validate_segment(
+            f"cat {HOLMES_TOOL_RESULT_STORAGE_PATH}/result.json",
+            allow_list,
+            deny_list,
+        )
+        assert result.status == ValidationStatus.ALLOWED
+
+
+class TestArgvFlagAwareDenyMatching:
+    """Flag-aware DENY matching.
+
+    This must land together with the allow side. The deny matcher is equally
+    flag-blind, so a flag-aware allow check on its own would let
+    `kubectl --context=p logs x` slip past a `kubectl logs` deny entry —
+    turning a configured block into an auto-approval.
+    """
+
+    def _lists(self, deny, allow=None):
+        config = BashExecutorConfig(
+            builtin_allowlist="extended", allow=allow or [], deny=deny
+        )
+        return get_effective_lists(config)
+
+    @pytest.mark.parametrize(
+        "command,prefixes",
+        [
+            ("kubectl --context=staging logs pod/x", ["kubectl logs"]),
+            ("kubectl --context staging logs pod/x", ["kubectl logs"]),
+            ("kubectl -n ns --context=p top nodes", ["kubectl top"]),
+            ("kubectl -n ns top pods", ["kubectl top"]),
+            # An env assignment must not smuggle a denied verb past the check.
+            ("TZ=UTC kubectl --context=p logs pod/x", ["kubectl logs"]),
+        ],
+    )
+    def test_deny_survives_interleaved_options(self, command, prefixes):
+        allow_list, deny_list = self._lists(["kubectl logs", "kubectl top"])
+        result = validate_command(command, prefixes, allow_list, deny_list)
+        assert result.status == ValidationStatus.DENIED
+        assert result.deny_reason == DenyReason.DENY_LIST
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "kubectl --context=p get secret/db",
+            "kubectl --context=p get secrets",
+            "kubectl --context=p get secrets/db",
+        ],
+    )
+    def test_deny_keeps_plural_and_path_aggressiveness_with_flags(self, command):
+        """Deny matching stays at least as aggressive as the string matcher:
+        the plural form and `resource/name` syntax are both still caught."""
+        allow_list, deny_list = self._lists(["kubectl get secret"])
+        result = validate_command(command, ["kubectl get"], allow_list, deny_list)
+        assert result.status == ValidationStatus.DENIED
+        assert result.deny_reason == DenyReason.DENY_LIST
+
+
 class TestValidationOrder:
     """Tests to verify the validation order is correct."""
 
