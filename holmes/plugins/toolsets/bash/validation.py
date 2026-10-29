@@ -590,6 +590,36 @@ def _match_argv_prefix(
     return idx == len(prefix_tokens)
 
 
+def _best_effort_argvs(command: str) -> List[List[str]]:
+    """Every simple command's argv, including inside a compound statement.
+
+    `parse_command` REFUSES a compound statement (`for`/`while`/`if`), so on
+    its own it returns nothing for exactly the commands that matter most here —
+    a loop is the main reason a command needs approval in the first place.
+    `scan_for_deny_checks` is the best-effort scanner that does see inside one.
+
+    Its tree may be wrong, so by contract the result may only ever be used to
+    DENY a command or to *clear* a prefix for further validation — NEVER as the
+    basis for allowing execution. Both callers respect that:
+
+    * the anti-fabrication check, where over-recovering an argv can only turn
+      an unappealable DENIED into an APPROVAL_REQUIRED the user decides on, and
+      every segment still faces the strict gates in `validate_segment`;
+    * the deny pass for unparseable commands, which only ever denies.
+    """
+    try:
+        return parse_command(command).command_argvs
+    except ShellParseError:
+        pass
+    try:
+        argvs, _targets = scan_for_deny_checks(command)
+        return argvs
+    except Exception:
+        # The scanner is best-effort by contract; a failure here just means we
+        # fall back to the string-based verdict.
+        return []
+
+
 def segment_argv(segment: str) -> Optional[List[str]]:
     """Parse a single segment and return its argv, or None if unavailable.
 
@@ -734,18 +764,15 @@ def validate_command(
     # (`kubectl get ... | grep x` suggests both "kubectl get" and "grep"), so a
     # prefix matching any argv is accounted for. Loose on purpose — the allow
     # and deny gates in validate_segment are the strict ones.
-    unparsed_argvs: Optional[List[List[str]]] = None
+    fabrication_argvs: Optional[List[List[str]]] = None
     for prefix in suggested_prefixes:
         if prefix in command:
             continue
-        if unparsed_argvs is None:
-            try:
-                unparsed_argvs = parse_command(command).command_argvs
-            except ShellParseError:
-                unparsed_argvs = []
+        if fabrication_argvs is None:
+            fabrication_argvs = _best_effort_argvs(command)
         if any(
             _match_argv_prefix(argv, prefix, match_plural=True)
-            for argv in unparsed_argvs
+            for argv in fabrication_argvs
         ):
             continue
         return ValidationResult(
@@ -773,6 +800,23 @@ def validate_command(
                 deny_reason=DenyReason.DENY_LIST,
                 message=f"Command matches deny list pattern '{denied}'. This command is blocked by configuration.",
             )
+        # The raw-string deny check above is flag-blind, exactly like
+        # match_prefix_for_deny: `kubectl logs` does not appear in
+        # `for p in a b; do kubectl --context=p logs $p; done`. This branch
+        # handles the commands parse_command REFUSES — compound statements
+        # among them — so without an argv pass a deny entry is unenforced in
+        # precisely the commands that most need approval.
+        #
+        # scan_for_deny_checks exists for this: best-effort argvs that may only
+        # be used to DENY, never to allow. That is all this does.
+        for argv in _best_effort_argvs(command):
+            for deny_prefix in deny_list:
+                if _match_argv_prefix(argv, deny_prefix, match_plural=True):
+                    return ValidationResult(
+                        status=ValidationStatus.DENIED,
+                        deny_reason=DenyReason.DENY_LIST,
+                        message=f"Command matches deny list pattern '{deny_prefix}'. This command is blocked by configuration.",
+                    )
         unsafe = check_unsafe_args_in_raw_command(command)
         if unsafe:
             return _unsafe_arg_result(unsafe, _unsafe_args_approval_mode())

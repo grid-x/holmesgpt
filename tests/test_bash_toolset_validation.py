@@ -767,6 +767,48 @@ class TestFabricationCheckIsNotStrict:
         assert result.status == ValidationStatus.APPROVAL_REQUIRED
         assert result.deny_reason is None
 
+    def test_flag_split_prefix_inside_a_loop_is_not_fabricated(self):
+        """The two failure modes COMBINED, which is what production actually hit.
+
+        `--context` sits between `kubectl` and `get`, so the substring test
+        fails; and the command is a `for` loop, which `parse_command` refuses
+        outright — so an argv fallback built on `parse_command` alone recovers
+        nothing and the denial stands. The fallback has to use the best-effort
+        scanner, which does see inside a compound statement.
+        """
+        command = (
+            "for ns in $(kubectl --context=ds-staging get ns "
+            "-o jsonpath='{.items[*].metadata.name}'); "
+            'do echo "$ns $(kubectl --context=ds-staging get pods -n $ns '
+            '--field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)"; done'
+        )
+        allow_list, deny_list = self._lists(["kubectl get", "wc", "echo"])
+        result = validate_command(
+            command, ["kubectl get", "wc"], allow_list, deny_list
+        )
+        assert result.status == ValidationStatus.APPROVAL_REQUIRED
+        assert result.deny_reason is None
+
+    def test_fabricated_prefix_inside_a_loop_is_still_denied(self):
+        """The looser fallback must not blunt the check for compound commands:
+        a prefix for a command that appears nowhere in the loop still fails."""
+        command = "for i in 1 2; do kubectl --context=p get pods; done"
+        allow_list, deny_list = self._lists(["kubectl get"])
+        result = validate_command(
+            command, ["helm upgrade"], allow_list, deny_list
+        )
+        assert result.status == ValidationStatus.DENIED
+        assert result.deny_reason == DenyReason.PREFIX_NOT_IN_COMMAND
+
+    def test_deny_list_still_wins_inside_a_loop(self):
+        """Clearing a prefix past the fabrication check must not let a denied
+        verb through: the strict gates run afterwards and still deny."""
+        command = "for p in a b; do kubectl --context=p logs $p; done"
+        allow_list, deny_list = self._lists(["kubectl get"], deny=["kubectl logs"])
+        result = validate_command(command, ["kubectl logs"], allow_list, deny_list)
+        assert result.status == ValidationStatus.DENIED
+        assert result.deny_reason == DenyReason.DENY_LIST
+
     def test_genuinely_fabricated_prefix_is_still_denied(self):
         """The check must keep working: a prefix for a command that is not here."""
         allow_list, deny_list = self._lists(["kubectl get"])
