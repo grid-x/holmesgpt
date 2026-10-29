@@ -507,6 +507,116 @@ def match_prefix_for_deny(segment: str, prefix: str) -> bool:
     return False
 
 
+def _annotate_option_tokens(argv: List[str]) -> List[Tuple[str, bool]]:
+    """Tag each argv token as an option (or an option's value) vs a positional.
+
+    Positionals carry the command's verbs (`kubectl get`), so only they are
+    compared against prefix words. Options are skipped wherever they appear.
+
+    `--flag=value` and `-n` are self-contained. In the SEPARATED form
+    (`--context prod`) the following word is the flag's VALUE, not a verb, and
+    must be tagged too — otherwise `kubectl --context prod get` would compare
+    `prod` against the prefix word `get` and fail.
+    """
+    annotated: List[Tuple[str, bool]] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("-"):
+            annotated.append((token, True))
+            # Separated form: consume the flag's value, which is not a verb.
+            # `--flag=value` already carries its value, and a following token
+            # that is itself an option starts a new flag rather than being a value.
+            if "=" not in token and i + 1 < len(argv):
+                following = argv[i + 1]
+                if not following.startswith("-"):
+                    annotated.append((following, True))
+                    i += 1
+        else:
+            annotated.append((token, False))
+        i += 1
+    return annotated
+
+
+def _match_argv_prefix(
+    argv: List[str], prefix: str, match_plural: bool = False
+) -> bool:
+    """Flag-aware prefix match against a parsed argv.
+
+    Every prefix word must match a positional token, consecutively and in
+    order; the first non-matching positional fails the match. Options between,
+    before or after the verbs are ignored.
+
+    This is deliberately NOT a loose subsequence scan: such a scan would also
+    match `kubectl delete pod get` against the prefix `kubectl get`, which is
+    fine for checking that a prefix is not fabricated but unsafe as an allow
+    gate.
+
+    `match_plural` mirrors `match_prefix_for_deny`'s extra aggressiveness: the
+    deny side also accepts the plural of the final prefix word, so a deny entry
+    of `kubectl get secret` still blocks `kubectl get secrets`. It is off for
+    allow matching, which must stay strict.
+    """
+    prefix_tokens = prefix.strip().split()
+    if not prefix_tokens or not argv:
+        return False
+
+    idx = 0
+    for token, is_option in _annotate_option_tokens(argv):
+        if idx == len(prefix_tokens):
+            break
+        if is_option:
+            continue
+
+        want = prefix_tokens[idx]
+        candidates = [want]
+        if match_plural and idx == len(prefix_tokens) - 1:
+            candidates.append(want + "s")
+
+        # The final prefix word also matches kubectl's `resource/name` syntax,
+        # so prefix `kubectl get secret` covers `kubectl get secret/my-secret`.
+        if any(
+            token == candidate
+            or (idx == len(prefix_tokens) - 1 and token.startswith(candidate + "/"))
+            for candidate in candidates
+        ):
+            idx += 1
+            continue
+
+        # A positional that is not the next expected prefix word means this is a
+        # different command (`kubectl delete ...` vs prefix `kubectl get`).
+        return False
+
+    return idx == len(prefix_tokens)
+
+
+def segment_argv(segment: str) -> Optional[List[str]]:
+    """Parse a single segment and return its argv, or None if unavailable.
+
+    Re-parsed from the segment rather than threaded in from `validate_command`
+    so this never depends on `parsed.segments` and `parsed.command_argvs` being
+    positionally parallel. They happen to be in this version — a bare
+    assignment now raises rather than producing a segment with no argv — but
+    that is an implementation detail of the parser, and zipping the two lists
+    by index would compare a segment against another command's argv if it ever
+    changed back.
+
+    Returns None when the segment cannot be parsed or is not a single simple
+    command, in which case callers fall back to the string-based matchers.
+    """
+    try:
+        parsed = parse_command(segment)
+    except ShellParseError:
+        return None
+
+    if len(parsed.command_argvs) != 1:
+        # No argv, or more than one (the caller handed us something that is not
+        # a single simple command): fall back to strings.
+        return None
+
+    return parsed.command_argvs[0]
+
+
 def validate_segment(
     segment: str, allow_list: List[str], deny_list: List[str]
 ) -> ValidationResult:
@@ -528,9 +638,29 @@ def validate_segment(
             message=f"Command contains '{blocked}' which is permanently blocked for security reasons and cannot be overridden.",
         )
 
+    # Both prefix checks below are string-OR-argv. The string matchers are
+    # `startswith` tests, so anything the shell puts before a command's verb
+    # defeats them: an option (`kubectl --context=p get`) or an environment
+    # assignment (`TZ=UTC date`). The argv matcher skips options and sees argv
+    # with assignments already stripped, which fixes both with one mechanism.
+    #
+    # Additive, so path-based prefixes such as the auto-allowed
+    # `cat <tool result storage>` keep working through the string matcher —
+    # those are not argv verbs at all.
+    argv = segment_argv(segment)
+
     # Step 2: Check deny list (using stricter matching)
+    #
+    # The deny side MUST get the same treatment as the allow side, and in the
+    # same change: a flag-aware allow check alone would let
+    # `kubectl --context=p logs x` slip past a `kubectl logs` deny entry,
+    # turning a configured block into an approval prompt a user can wave
+    # through. `match_plural` keeps the string matcher's extra aggressiveness.
     for deny_prefix in deny_list:
-        if match_prefix_for_deny(segment, deny_prefix):
+        if match_prefix_for_deny(segment, deny_prefix) or (
+            argv is not None
+            and _match_argv_prefix(argv, deny_prefix, match_plural=True)
+        ):
             return ValidationResult(
                 status=ValidationStatus.DENIED,
                 deny_reason=DenyReason.DENY_LIST,
@@ -539,7 +669,9 @@ def validate_segment(
 
     # Step 3: Check allow list
     for allow_prefix in allow_list:
-        if match_prefix(segment, allow_prefix):
+        if match_prefix(segment, allow_prefix) or (
+            argv is not None and _match_argv_prefix(argv, allow_prefix)
+        ):
             return ValidationResult(status=ValidationStatus.ALLOWED)
 
     # Step 4: Not in any list -> needs approval
@@ -567,14 +699,60 @@ def validate_command(
     Returns:
         ValidationResult with status and details
     """
-    # Verify all suggested prefixes actually appear in the command
+    # Hardcoded blocks come FIRST, before the fabrication check below.
+    #
+    # Both outcomes are DENIED, so this changes no decision — but it reports
+    # the real one. `sudo kubectl --context=p get nodes` would otherwise be
+    # denied as a fabricated prefix (`sudo` takes the first positional, so the
+    # prefix `kubectl get` matches neither the string nor the argv), telling the
+    # model to fix its prefixes when the actual problem is that `sudo` is
+    # permanently blocked. The model then retries the same blocked command with
+    # different prefixes instead of giving up.
+    blocked_outright = check_blocked_in_raw_command(command, HARDCODED_BLOCKS)
+    if blocked_outright:
+        return ValidationResult(
+            status=ValidationStatus.DENIED,
+            deny_reason=DenyReason.HARDCODED_BLOCK,
+            message=f"Command contains '{blocked_outright}' which is permanently blocked for security reasons and cannot be overridden.",
+        )
+
+    # Verify all suggested prefixes actually appear in the command.
+    #
+    # This is an anti-FABRICATION check — it only establishes that the model did
+    # not invent a prefix for a command it is not running — so it is allowed to
+    # be loose. It must NOT be strict: a false positive here is a DENIED, which
+    # unlike APPROVAL_REQUIRED the user can never approve, so an ordinary
+    # read-only command fails outright with no way forward.
+    #
+    # A plain substring test is too strict in exactly the case our config
+    # produces, because an option can split the words of a prefix:
+    #
+    #     "kubectl get" not in "kubectl --context=staging get nodes"
+    #
+    # So fall back to the flag-aware argv match, which skips options. Checked
+    # per simple command: a prefix belongs to ONE of the command's segments
+    # (`kubectl get ... | grep x` suggests both "kubectl get" and "grep"), so a
+    # prefix matching any argv is accounted for. Loose on purpose — the allow
+    # and deny gates in validate_segment are the strict ones.
+    unparsed_argvs: Optional[List[List[str]]] = None
     for prefix in suggested_prefixes:
-        if prefix not in command:
-            return ValidationResult(
-                status=ValidationStatus.DENIED,
-                deny_reason=DenyReason.PREFIX_NOT_IN_COMMAND,
-                message=f"Suggested prefix '{prefix}' does not appear in the command.",
-            )
+        if prefix in command:
+            continue
+        if unparsed_argvs is None:
+            try:
+                unparsed_argvs = parse_command(command).command_argvs
+            except ShellParseError:
+                unparsed_argvs = []
+        if any(
+            _match_argv_prefix(argv, prefix, match_plural=True)
+            for argv in unparsed_argvs
+        ):
+            continue
+        return ValidationResult(
+            status=ValidationStatus.DENIED,
+            deny_reason=DenyReason.PREFIX_NOT_IN_COMMAND,
+            message=f"Suggested prefix '{prefix}' does not appear in the command.",
+        )
 
     # Parse command into segments and detect compound statements
     try:
