@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../../assets/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -1255,6 +1255,8 @@
       
         
       
+        
+      
     
     
     
@@ -1675,6 +1677,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../ai-providers/model-limits/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Models Missing from LiteLLM
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../ai-providers/robusta-ai/" class="md-nav__link">
         
   
@@ -1854,8 +1884,6 @@
       
         
           
-        
-      
         
       
         
@@ -2814,34 +2842,6 @@
     
   
     Kafka
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../data-sources/builtin-toolsets/kubectl-run/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Kubectl Run
   
 
     
@@ -4019,6 +4019,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -4066,6 +4070,62 @@
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
             
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/evaluations/history/results_20261021_072130/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ⚡ October 21, 2026
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/evaluations/history/results_20261010_213752/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ⚡ October 10, 2026
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
               
             
               
@@ -5804,13 +5864,13 @@
 <p>Allow outbound HTTPS (port 443) from the HolmesGPT pod to the Robusta platform — i.e. allowlist the <code>robusta.dev</code> domain (<code>*.robusta.dev</code>), which covers the <code>api.*</code> and <code>sp.*</code> subdomains across all regions.</p>
 <p>To confirm the block, run the one-off pod below. It <strong>auto-detects the Holmes pod's namespace and image</strong> and curls the platform from a fresh pod — the HolmesGPT pod itself crashes on this error (<code>CrashLoopBackOff</code>), so <code>kubectl exec</code> into it won't work. Reusing Holmes's own image means nothing new is pulled (the same firewall may also block image pulls) and it shares Holmes's CA and network config. Just pick your region — a firewall block shows <code>Connection reset by peer</code>, while a reachable endpoint returns JSON:</p>
 <div class="tabbed-set" data-tabs="1:3">
-<input checked="checked" id="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed_1" name="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed" type="radio">
-<input id="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed_2" name="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed" type="radio">
-<input id="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed_3" name="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed" type="radio">
+<input checked="checked" id="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec_1" name="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec" type="radio">
+<input id="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec_2" name="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec" type="radio">
+<input id="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec_3" name="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec" type="radio">
 <div class="tabbed-labels">
-<label for="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed_1">US</label>
-<label for="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed_2">EU</label>
-<label for="__tabbed_bca936c1_f981_44d5_badd_2797b296a2ed_3">AP</label>
+<label for="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec_1">US</label>
+<label for="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec_2">EU</label>
+<label for="__tabbed_056ff0fc_aa7d_41e3_a7fd_9cf4c6091bec_3">AP</label>
 </div>
 <div class="tabbed-content">
 <div class="tabbed-block"><pre><code class="language-bash">read -r NS IMG &lt;&lt;&lt;&quot;$(kubectl get pods -A -l app=holmes -o jsonpath=&#x27;{.items[0].metadata.namespace} {.items[0].spec.containers[0].image}&#x27;)&quot;
@@ -5969,7 +6029,7 @@ For website terms of use, trademark policy and other project policies please see
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["announce.dismiss", "content.action.edit", "content.action.view", "content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.prefetch", "navigation.path", "navigation.top", "navigation.tracking", "search.highlight", "search.share", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "latest", "provider": "mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
       
         <script src="../../javascripts/tabsync.js"></script>
       
