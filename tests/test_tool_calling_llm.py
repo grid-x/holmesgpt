@@ -372,6 +372,124 @@ class TestApprovalCallbackFlow:
         assert result.result == "OK I won't delete it"
 
 
+class TestFindAssistantToolCallRequest:
+    """`tool_calls` present-and-null must not crash the lookup.
+
+    Reported from production: a bash loop needing approval paused the stream
+    and then died with
+
+        File ".../tool_calling_llm.py", in find_assistant_tool_call_request
+          for tool_call in message.get("tool_calls", []):
+        TypeError: 'NoneType' object is not iterable
+
+    `.get(key, default)` only falls back when the key is ABSENT. Bedrock emits
+    an explicit `"tool_calls": null` on a text-only assistant turn, and a
+    history that has round-tripped through a client preserves it, so the key is
+    present with a None value and the `[]` default never applies.
+
+    This is only reachable once a pause actually happens, which is why
+    enabling tool approval surfaced it: `find_assistant_tool_call_request` is
+    called solely to stamp `pending_approval` / `pending_frontend` onto the
+    paused call, and it scans the WHOLE history to do so — including earlier
+    text-only turns.
+    """
+
+    def test_explicit_null_tool_calls_is_skipped(self, make_ai):
+        ai = make_ai()
+        messages = [
+            {"role": "user", "content": "hi"},
+            # The shape that crashed: key present, value null.
+            {"role": "assistant", "content": "Hello!", "tool_calls": None},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "tc_1", "function": {"name": "bash"}}],
+            },
+        ]
+
+        found = ai.find_assistant_tool_call_request(
+            tool_call_id="tc_1", messages=messages
+        )
+
+        assert found["id"] == "tc_1"
+
+    def test_absent_tool_calls_is_still_skipped(self, make_ai):
+        """The case the `[]` default did cover must keep working."""
+        ai = make_ai()
+        messages = [
+            {"role": "assistant", "content": "Hello!"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "tc_1", "function": {"name": "bash"}}],
+            },
+        ]
+
+        assert (
+            ai.find_assistant_tool_call_request(
+                tool_call_id="tc_1", messages=messages
+            )["id"]
+            == "tc_1"
+        )
+
+    def test_genuinely_missing_id_still_raises(self, make_ai):
+        """Skipping null must not turn a real bug into a silent miss."""
+        ai = make_ai()
+        messages = [{"role": "assistant", "content": "Hello!", "tool_calls": None}]
+
+        with pytest.raises(Exception, match="Failed to find assistant request"):
+            ai.find_assistant_tool_call_request(
+                tool_call_id="tc_missing", messages=messages
+            )
+
+    @patch(LIMIT_PATCH, side_effect=_make_context_limiter_passthrough)
+    def test_approval_pause_survives_a_null_tool_calls_turn(
+        self, _mock_limit, make_ai, mock_llm
+    ):
+        """End to end: the pause must be emitted, not raise.
+
+        The history starts with a text-only assistant turn carrying
+        `tool_calls: None` — a plain greeting, which is exactly what preceded
+        the reported crash — and then a tool call needing approval.
+        """
+        tc = _make_mock_tool_call(tool_call_id="tc_loop", tool_name="bash")
+        mock_llm.completion.side_effect = [
+            _make_llm_response(content="Counting pods", tool_calls=[tc])
+        ]
+
+        ai = make_ai()
+        ai._invoke_llm_tool_call = MagicMock(
+            return_value=_make_tool_call_result_approval(
+                tool_call_id="tc_loop", tool_name="bash"
+            )
+        )
+        ai._is_tool_call_already_approved = MagicMock(return_value=False)
+
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello! How can I help?", "tool_calls": None},
+            {"role": "user", "content": "count the pods in each namespace"},
+        ]
+
+        events = list(ai.call_stream(msgs=messages, enable_tool_approval=True))
+
+        approval_events = [
+            e for e in events if e.event == StreamEvents.APPROVAL_REQUIRED
+        ]
+        assert len(approval_events) == 1, (
+            "stream must pause for approval, not raise TypeError"
+        )
+        pending = approval_events[0].data["pending_approvals"]
+        assert [p["tool_call_id"] for p in pending] == ["tc_loop"]
+
+        # The paused call still gets stamped and signed.
+        paused = ai.find_assistant_tool_call_request(
+            tool_call_id="tc_loop", messages=approval_events[0].data["messages"]
+        )
+        assert paused["pending_approval"] is True
+        assert paused["approval_token"]
+
+
 # ---------------------------------------------------------------------------
 # Test 3b: Approval required but no approval flow available
 # ---------------------------------------------------------------------------

@@ -1659,7 +1659,18 @@ class ToolCallingLLM:
     ) -> dict[str, Any]:
         for message in messages:
             if message.get("role") == "assistant":
-                for tool_call in message.get("tool_calls", []):
+                # `or []`, not a `.get` default: the default only applies when
+                # the key is ABSENT. Bedrock sends an explicit
+                # "tool_calls": null on a text-only assistant turn, and a
+                # conversation history that has round-tripped through a client
+                # preserves it, so the key is present and None -- which makes
+                # `.get("tool_calls", [])` return None and the loop raise
+                # `TypeError: 'NoneType' object is not iterable`.
+                #
+                # The three sibling loops over msg["tool_calls"] in this file
+                # are each already guarded by a preceding truthiness check
+                # (`and msg.get("tool_calls")`); this one had none.
+                for tool_call in message.get("tool_calls") or []:
                     if tool_call.get("id") == tool_call_id:
                         return tool_call
 
