@@ -1056,7 +1056,7 @@ class ToolCallingLLM:
         """Execute the load_tools meta-tool: find held-back tools matching the query
         and mark them loaded, so the next agent step can call them."""
         query = (tool_params or {}).get("query", "") or ""
-        matched = self.tool_executor.search_deferred_tools(query)
+        matched, total = self.tool_executor.search_deferred_tools(query)
         self._loaded_tool_names.update(matched)
         if matched:
             lines = []
@@ -1070,10 +1070,18 @@ class ToolCallingLLM:
                 f"Loaded {len(matched)} tool(s) matching '{query}'. They are now "
                 "available -- call them directly on your next step:\n" + "\n".join(lines)
             )
+            if total > len(matched):
+                # Say so explicitly. A truncated list that reads as complete is worse
+                # than no result: the model calls what it was shown and never learns
+                # the tool it needed exists.
+                data += (
+                    f"\n\nNOTE: {total} tools matched but only the first "
+                    f"{len(matched)} were loaded. Narrow the query to reach the rest."
+                )
         else:
             data = (
-                f"No tools matched '{query}'. Try broader keywords or an integration "
-                "name."
+                f"No tools matched '{query}'. Try broader keywords or a single "
+                "integration name (e.g. 'buildkite', 'grafana', 'nexus')."
             )
         logging.info(f"load_tools(query={query!r}) -> {matched}")
         return ToolCallResult(

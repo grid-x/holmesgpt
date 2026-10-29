@@ -2137,10 +2137,10 @@ class TestToolSearchAnthropicMode:
 
 class TestLoadToolsHandling:
     def test_load_tools_loads_matches(self, make_ai, mock_tool_executor):
-        mock_tool_executor.search_deferred_tools.return_value = [
-            "search_dashboards",
-            "kb_search",
-        ]
+        mock_tool_executor.search_deferred_tools.return_value = (
+            ["search_dashboards", "kb_search"],
+            2,
+        )
         mock_tool_executor.get_tool_by_name.return_value = None
         ai = make_ai()
 
@@ -2153,7 +2153,7 @@ class TestLoadToolsHandling:
         assert "search_dashboards" in result.result.data
 
     def test_load_tools_with_no_match(self, make_ai, mock_tool_executor):
-        mock_tool_executor.search_deferred_tools.return_value = []
+        mock_tool_executor.search_deferred_tools.return_value = ([], 0)
         ai = make_ai()
 
         result = ai._handle_load_tools("tc2", {"query": "zzz"})
@@ -2161,6 +2161,30 @@ class TestLoadToolsHandling:
         assert ai._loaded_tool_names == set()
         assert result.result.status == StructuredToolResultStatus.SUCCESS
         assert "No tools matched" in result.result.data
+
+    def test_truncation_is_reported_to_the_model(self, make_ai, mock_tool_executor):
+        """When the limit withholds matches, say so. Silently handing back a partial
+        list made a 16-tool MCP server look like an 8-tool one: the model called what
+        it was shown and had no way to learn list_jobs/read_logs existed."""
+        mock_tool_executor.search_deferred_tools.return_value = (["get_build"], 16)
+        mock_tool_executor.get_tool_by_name.return_value = None
+        ai = make_ai()
+
+        result = ai._handle_load_tools("tc_trunc", {"query": "buildkite"})
+
+        assert "16 tools matched" in result.result.data
+        assert "only the first 1" in result.result.data
+
+    def test_no_truncation_note_when_nothing_withheld(
+        self, make_ai, mock_tool_executor
+    ):
+        mock_tool_executor.search_deferred_tools.return_value = (["get_build"], 1)
+        mock_tool_executor.get_tool_by_name.return_value = None
+        ai = make_ai()
+
+        result = ai._handle_load_tools("tc_full", {"query": "get_build"})
+
+        assert "NOTE:" not in result.result.data
 
     def test_server_search_call_is_absorbed(self, make_ai, mock_tool_executor):
         """litellm 1.89.0 converts Anthropic's server-side search into a client tool
@@ -2229,7 +2253,7 @@ class TestLoadToolsHandling:
             _make_llm_response(content="searching", tool_calls=[load_tools_tc]),
             _make_llm_response(content="Found tools", tool_calls=None),
         ]
-        mock_tool_executor.search_deferred_tools.return_value = ["search_dashboards"]
+        mock_tool_executor.search_deferred_tools.return_value = (["search_dashboards"], 1)
         mock_tool_executor.get_tool_by_name.return_value = None
 
         ai = make_ai()

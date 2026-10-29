@@ -86,8 +86,12 @@ TOOL_SEARCH_MODE = os.environ.get("HOLMES_TOOL_SEARCH_MODE", "load_tools").strip
 # Comma-separated toolset types whose tools are deferred. Defaults to MCP toolsets,
 # which dominate schema bloat; built-ins stay loaded so common ops skip the search hop.
 TOOL_SEARCH_DEFER_TYPES = os.environ.get("HOLMES_TOOL_SEARCH_DEFER_TYPES", "mcp")
-# Max number of tools a single load_tools call may load.
-TOOL_SEARCH_RESULT_LIMIT = int(os.environ.get("HOLMES_TOOL_SEARCH_RESULT_LIMIT", "8"))
+# Max number of tools a single load_tools call may load. Must comfortably exceed the
+# tool count of a single MCP server, or asking for one integration by name silently
+# returns a truncated slice of it: the buildkite server alone exposes 16 tools, and a
+# limit of 8 made list_jobs/read_logs/search_logs unreachable. The cap only exists to
+# stop a query like "." from loading the whole catalog at once.
+TOOL_SEARCH_RESULT_LIMIT = int(os.environ.get("HOLMES_TOOL_SEARCH_RESULT_LIMIT", "40"))
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "").strip().lower()
 
 

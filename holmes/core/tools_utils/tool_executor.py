@@ -27,7 +27,9 @@ def _deferrable_toolset_types() -> frozenset:
     "custom", "http", "database", "mongodb"); unknown names are ignored.
     """
     return frozenset(
-        part.strip().lower() for part in TOOL_SEARCH_DEFER_TYPES.split(",") if part.strip()
+        part.strip().lower()
+        for part in TOOL_SEARCH_DEFER_TYPES.split(",")
+        if part.strip()
     )
 
 
@@ -89,7 +91,13 @@ class ToolExecutor:
                 msg = f"Overriding toolset '{ts.name}'!"
                 display_logger.warning(msg)
                 if on_event is not None:
-                    on_event(StatusEvent(kind=StatusEventKind.TOOL_OVERRIDE, name=ts.name, message=msg))
+                    on_event(
+                        StatusEvent(
+                            kind=StatusEventKind.TOOL_OVERRIDE,
+                            name=ts.name,
+                            message=msg,
+                        )
+                    )
             toolsets_by_name[ts.name] = ts
 
         self.tools_by_name: dict[str, Tool] = {}
@@ -106,7 +114,13 @@ class ToolExecutor:
                 msg = f"Overriding existing tool '{resolved_name} with new tool from {ts.name} at {ts.path}'!"
                 display_logger.warning(msg)
                 if on_event is not None:
-                    on_event(StatusEvent(kind=StatusEventKind.TOOL_OVERRIDE, name=resolved_name, message=msg))
+                    on_event(
+                        StatusEvent(
+                            kind=StatusEventKind.TOOL_OVERRIDE,
+                            name=resolved_name,
+                            message=msg,
+                        )
+                    )
             self.tools_by_name[resolved_name] = tool
             self._tool_to_toolset[resolved_name] = ts
 
@@ -114,7 +128,9 @@ class ToolExecutor:
 
     # ── Tool lookup ────────────────────────────────────────────────────
 
-    def get_tool_by_name(self, name: str, user_id: Optional[str] = None) -> Optional[Tool]:
+    def get_tool_by_name(
+        self, name: str, user_id: Optional[str] = None
+    ) -> Optional[Tool]:
         if name in self.tools_by_name:
             return self.tools_by_name[name]
         # Check per-user OAuth tools (registered in _tool_to_toolset but not in tools_by_name)
@@ -124,9 +140,13 @@ class ToolExecutor:
         logging.warning(f"could not find tool {name}. skipping")
         return None
 
-    def get_toolset_name(self, tool_name: str, user_id: Optional[str] = None) -> Optional[str]:
+    def get_toolset_name(
+        self, tool_name: str, user_id: Optional[str] = None
+    ) -> Optional[str]:
         """Return the toolset name that provides a given tool, or None."""
-        ts = self._tool_to_toolset.get(tool_name) or self.oauth_connector.get_toolset(tool_name, user_id)
+        ts = self._tool_to_toolset.get(tool_name) or self.oauth_connector.get_toolset(
+            tool_name, user_id
+        )
         return ts.name if ts else None
 
     def ensure_toolset_initialized(self, tool_name: str) -> Optional[str]:
@@ -144,7 +164,9 @@ class ToolExecutor:
 
         if toolset.needs_initialization:
             if not toolset.lazy_initialize():
-                error_msg = f"Toolset '{toolset.name}' failed to initialize: {toolset.error}"
+                error_msg = (
+                    f"Toolset '{toolset.name}' failed to initialize: {toolset.error}"
+                )
                 logging.error(error_msg)
                 return error_msg
         elif toolset.status == ToolsetStatusEnum.FAILED:
@@ -180,9 +202,7 @@ class ToolExecutor:
 
         for tool in extra_tools:
             if tool.name in clone.tools_by_name:
-                logging.warning(
-                    f"Frontend tool '{tool.name}' overrides existing tool"
-                )
+                logging.warning(f"Frontend tool '{tool.name}' overrides existing tool")
             clone.tools_by_name[tool.name] = tool
             # No toolset mapping — frontend tools don't belong to a toolset,
             # so ensure_toolset_initialized() returns None (no-op) for them.
@@ -203,7 +223,9 @@ class ToolExecutor:
                      user's real tools (loaded after authentication).
         """
         tools = self._get_base_tools()
-        return self.oauth_connector.apply_user_tools(tools, user_id, self._tool_to_toolset)
+        return self.oauth_connector.apply_user_tools(
+            tools, user_id, self._tool_to_toolset
+        )
 
     def _get_base_tools(self) -> list:
         """Get all tools in OpenAI format (base set, no per-user overrides)."""
@@ -247,35 +269,64 @@ class ToolExecutor:
             tools.append(tool.get_openai_format())
         if include_load_tools:
             tools.append(LOAD_TOOLS_TOOL)
-        return self.oauth_connector.apply_user_tools(tools, user_id, self._tool_to_toolset)
+        return self.oauth_connector.apply_user_tools(
+            tools, user_id, self._tool_to_toolset
+        )
+
+    def _build_matcher(self, query: str):
+        """Build the predicate search_deferred_tools matches each tool's text against.
+
+        A single term is used as a regex (``re.search``), falling back to a
+        case-insensitive substring match when it isn't valid regex -- models do emit a
+        bare "[" or "(".
+
+        Multiple whitespace-separated terms are treated as OR, not as one literal
+        phrase. A query like "buildkite list_jobs read_logs" is the model naming the
+        several tools it wants; as a single regex that phrase matches nothing, because
+        no tool's text contains all those words in that order. Each term is still
+        tried as a regex so "kube.*logs" keeps working.
+        """
+        terms = query.split()
+        if len(terms) == 1:
+            terms = [query]
+
+        predicates = []
+        for term in terms:
+            try:
+                pattern = re.compile(term, re.IGNORECASE)
+                predicates.append(pattern.search)
+            except re.error:
+                needle = term.lower()
+                predicates.append(lambda text, needle=needle: needle in text.lower())
+
+        def matches(text: str) -> bool:
+            return any(predicate(text) for predicate in predicates)
+
+        return matches
 
     def search_deferred_tools(
         self, query: str, limit: Optional[int] = None
-    ) -> List[str]:
-        """Return names of held-back (deferrable) tools matching ``query``.
+    ) -> Tuple[List[str], int]:
+        """Find held-back (deferrable) tools matching ``query``.
 
-        ``query`` is treated as a regular expression (``re.search``); if it isn't valid
-        regex it falls back to a case-insensitive substring match -- models do emit a
-        bare "[" or "(". Each tool's name, description and owning toolset's
-        name/description are searched, so "grafana" matches every tool in the grafana
-        toolset even when individual tool descriptions don't repeat the word.
+        Returns ``(names, total_matched)``. ``names`` is capped at the result limit;
+        ``total_matched`` is how many matched before capping, so the caller can tell
+        the model its result was truncated. Silently returning a truncated list is
+        what made a 16-tool MCP server look like an 8-tool one, with the tools that
+        were cut (list_jobs, read_logs, search_logs) unreachable and unmentioned.
+
+        Each tool's name, description and owning toolset's name/description are
+        searched, so "grafana" matches every tool in the grafana toolset even when the
+        individual tool descriptions don't repeat the word.
         """
         query = (query or "").strip()
         if not query:
-            return []
+            return [], 0
         effective_limit = TOOL_SEARCH_RESULT_LIMIT if limit is None else limit
-        try:
-            pattern = re.compile(query, re.IGNORECASE)
-
-            def matches(text: str) -> bool:
-                return bool(pattern.search(text))
-        except re.error:
-            needle = query.lower()
-
-            def matches(text: str) -> bool:
-                return needle in text.lower()
+        matches = self._build_matcher(query)
 
         results: List[str] = []
+        total = 0
         for name, tool in self.tools_by_name.items():
             if not self._is_deferrable(name):
                 continue
@@ -292,7 +343,7 @@ class ToolExecutor:
                 )
             )
             if matches(haystack):
-                results.append(name)
-                if len(results) >= effective_limit:
-                    break
-        return results
+                total += 1
+                if len(results) < effective_limit:
+                    results.append(name)
+        return results, total

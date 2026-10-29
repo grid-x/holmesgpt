@@ -97,28 +97,58 @@ def test_visible_tools_include_a_loaded_mcp_tool():
 
 def test_search_deferred_tools_matches_mcp_only():
     ex = _executor_with_search()
-    assert ex.search_deferred_tools("dashboards") == ["search_dashboards"]
+    assert ex.search_deferred_tools("dashboards") == (["search_dashboards"], 1)
     # Matches via the owning toolset's name, even though the tool name/description
     # never says "nexus".
-    assert ex.search_deferred_tools("nexus") == ["kb_search"]
-    assert ex.search_deferred_tools("kubectl") == []  # built-in isn't deferrable
-    assert ex.search_deferred_tools("no-such-thing") == []
-    assert ex.search_deferred_tools("") == []
+    assert ex.search_deferred_tools("nexus") == (["kb_search"], 1)
+    assert ex.search_deferred_tools("kubectl") == ([], 0)  # built-in isn't deferrable
+    assert ex.search_deferred_tools("no-such-thing") == ([], 0)
+    assert ex.search_deferred_tools("") == ([], 0)
 
 
 def test_search_deferred_tools_falls_back_for_invalid_regex():
     # A malformed regex (models do emit a bare "[" or "(") must not raise; it falls
     # back to a case-insensitive substring match.
     ex = _executor_with_search()
-    assert ex.search_deferred_tools("[") == []
-    assert ex.search_deferred_tools("(") == []
+    assert ex.search_deferred_tools("[") == ([], 0)
+    assert ex.search_deferred_tools("(") == ([], 0)
 
 
-def test_search_deferred_tools_honours_limit():
+def test_search_deferred_tools_reports_truncation():
+    """The cap must be reported, not applied silently. A truncated list that reads as
+    complete is how a 16-tool MCP server looked like an 8-tool one, leaving the tools
+    that were cut unreachable and unmentioned."""
     ex = _executor_with_search()
-    # "." matches everything, so only the limit caps the result.
-    assert len(ex.search_deferred_tools(".", limit=1)) == 1
-    assert len(ex.search_deferred_tools(".")) == 2
+    names, total = ex.search_deferred_tools(".", limit=1)
+    assert len(names) == 1
+    assert total == 2  # caller can see 2 matched, so 1 was withheld
+
+    names, total = ex.search_deferred_tools(".")
+    assert len(names) == total == 2  # nothing withheld
+
+
+def test_multi_term_query_is_or_not_a_literal_phrase():
+    """A model that names several tools in one query must get them all.
+
+    As a single regex, "grafana kb_search" matches nothing -- no tool's text contains
+    those words in that order -- so a multi-word query silently returned zero results
+    even though both tools existed. It is also valid regex, so the invalid-regex
+    substring fallback never fired.
+    """
+    ex = _executor_with_search()
+    names, total = ex.search_deferred_tools("search_dashboards kb_search")
+    assert set(names) == {"search_dashboards", "kb_search"}
+    assert total == 2
+
+    # A term that matches nothing doesn't suppress the ones that do.
+    names, _ = ex.search_deferred_tools("kb_search no_such_tool")
+    assert names == ["kb_search"]
+
+
+def test_regex_queries_still_work_for_a_single_term():
+    ex = _executor_with_search()
+    assert ex.search_deferred_tools("search_dash.*ds")[0] == ["search_dashboards"]
+    assert ex.search_deferred_tools("kb_(search|lookup)")[0] == ["kb_search"]
 
 
 def test_deferrable_helpers_report_the_mcp_tools():
