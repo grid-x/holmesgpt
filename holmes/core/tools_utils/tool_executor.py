@@ -1,9 +1,12 @@
 import logging
+import re
 from typing import Dict, List, Optional, Tuple
 
 import sentry_sdk
 
+from holmes.common.env_vars import TOOL_SEARCH_DEFER_TYPES, TOOL_SEARCH_RESULT_LIMIT
 from holmes.core.init_event import EventCallback, StatusEvent, StatusEventKind
+from holmes.core.tool_search import LOAD_TOOLS_TOOL
 from holmes.core.tools import (
     Tool,
     Toolset,
@@ -12,6 +15,20 @@ from holmes.core.tools import (
 from holmes.core.tools_utils.oauth_tool_connector import OAuthToolConnector
 
 display_logger = logging.getLogger("holmes.display.tool_executor")
+
+
+def _deferrable_toolset_types() -> frozenset:
+    """Toolset types whose tools are held back until loaded on demand.
+
+    Driven by HOLMES_TOOL_SEARCH_DEFER_TYPES (comma-separated ToolsetType values).
+    MCP servers dominate tool-schema bloat, so they are the default; built-in
+    toolsets (kubernetes, bash, ...) stay loaded so common operations don't pay a
+    search hop. Values are matched against ToolsetType values ("mcp", "built-in",
+    "custom", "http", "database", "mongodb"); unknown names are ignored.
+    """
+    return frozenset(
+        part.strip().lower() for part in TOOL_SEARCH_DEFER_TYPES.split(",") if part.strip()
+    )
 
 
 def _mcp_tool_name(tool: "Tool") -> str:
@@ -191,3 +208,91 @@ class ToolExecutor:
     def _get_base_tools(self) -> list:
         """Get all tools in OpenAI format (base set, no per-user overrides)."""
         return [tool.get_openai_format() for tool in self.tools_by_name.values()]
+
+    # -- Tool search (progressive disclosure) ---------------------------------
+
+    def _is_deferrable(self, tool_name: str) -> bool:
+        """Whether a tool is held back from the default list until loaded on demand."""
+        toolset = self._tool_to_toolset.get(tool_name)
+        if toolset is None:
+            return False
+        ts_type = getattr(toolset.type, "value", toolset.type)
+        return str(ts_type).lower() in _deferrable_toolset_types()
+
+    def has_deferrable_tools(self) -> bool:
+        """Whether any tool would be held back. Used to skip tool search entirely
+        when there is nothing to defer -- exposing load_tools (or Anthropic's search
+        tool) with an empty deferred set would only waste a turn."""
+        return any(self._is_deferrable(name) for name in self.tools_by_name)
+
+    def get_deferrable_tool_names(self) -> List[str]:
+        """Names of every tool that tool search holds back."""
+        return [name for name in self.tools_by_name if self._is_deferrable(name)]
+
+    def get_visible_tools_openai_format(
+        self,
+        loaded_tool_names: Optional[set] = None,
+        user_id: Optional[str] = None,
+        include_load_tools: bool = True,
+    ) -> list:
+        """Tool-search mode: core (non-deferrable) tools + the ``load_tools`` meta-tool
+        + any deferrable tools already loaded this conversation. Heavy tool schemas stay
+        out of context until the model loads them.
+        """
+        loaded = loaded_tool_names or set()
+        tools = []
+        for tool in self.tools_by_name.values():
+            if self._is_deferrable(tool.name) and tool.name not in loaded:
+                continue
+            tools.append(tool.get_openai_format())
+        if include_load_tools:
+            tools.append(LOAD_TOOLS_TOOL)
+        return self.oauth_connector.apply_user_tools(tools, user_id, self._tool_to_toolset)
+
+    def search_deferred_tools(
+        self, query: str, limit: Optional[int] = None
+    ) -> List[str]:
+        """Return names of held-back (deferrable) tools matching ``query``.
+
+        ``query`` is treated as a regular expression (``re.search``); if it isn't valid
+        regex it falls back to a case-insensitive substring match -- models do emit a
+        bare "[" or "(". Each tool's name, description and owning toolset's
+        name/description are searched, so "grafana" matches every tool in the grafana
+        toolset even when individual tool descriptions don't repeat the word.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        effective_limit = TOOL_SEARCH_RESULT_LIMIT if limit is None else limit
+        try:
+            pattern = re.compile(query, re.IGNORECASE)
+
+            def matches(text: str) -> bool:
+                return bool(pattern.search(text))
+        except re.error:
+            needle = query.lower()
+
+            def matches(text: str) -> bool:
+                return needle in text.lower()
+
+        results: List[str] = []
+        for name, tool in self.tools_by_name.items():
+            if not self._is_deferrable(name):
+                continue
+            ts = self._tool_to_toolset.get(name)
+            haystack = " ".join(
+                filter(
+                    None,
+                    [
+                        name,
+                        tool.description or "",
+                        ts.name if ts else "",
+                        (ts.description or "") if ts else "",
+                    ],
+                )
+            )
+            if matches(haystack):
+                results.append(name)
+                if len(results) >= effective_limit:
+                    break
+        return results

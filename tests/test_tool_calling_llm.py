@@ -1990,3 +1990,251 @@ class TestRepeatedCallsAfterOverflowingCompaction:
         results = _events_of_type(events, StreamEvents.TOOL_RESULT)
         assert ai._directly_invoke_tool_call.call_count == 2
         assert "already been called" in json.dumps(results[-1].data)
+
+
+# ---------------------------------------------------------------------------
+# Tool search: _get_tools routing, load_tools interception, state handling.
+# See holmes/core/tool_search.py for why load_tools is the default mode.
+# ---------------------------------------------------------------------------
+
+TOOL_SEARCH_ENABLED_PATCH = "holmes.core.tool_calling_llm.TOOL_SEARCH_ENABLED"
+TOOL_SEARCH_MODE_PATCH = "holmes.core.tool_calling_llm.TOOL_SEARCH_MODE"
+
+
+def _anthropic_tool(name: str) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": f"Tool {name}",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+class TestToolSearchGetTools:
+    def test_full_listing_when_disabled(self, make_ai, mock_tool_executor):
+        mock_tool_executor.has_deferrable_tools.return_value = True
+        ai = make_ai()
+        with patch(TOOL_SEARCH_ENABLED_PATCH, False):
+            ai._get_tools()
+        mock_tool_executor.get_all_tools_openai_format.assert_called_once()
+        mock_tool_executor.get_visible_tools_openai_format.assert_not_called()
+
+    def test_visible_listing_when_enabled(self, make_ai, mock_tool_executor):
+        mock_tool_executor.has_deferrable_tools.return_value = True
+        ai = make_ai()
+        with patch(TOOL_SEARCH_ENABLED_PATCH, True), patch(
+            TOOL_SEARCH_MODE_PATCH, "load_tools"
+        ):
+            ai._get_tools()
+        mock_tool_executor.get_visible_tools_openai_format.assert_called_once()
+
+    def test_skipped_when_nothing_is_deferrable(self, make_ai, mock_tool_executor):
+        """No MCP toolsets -> no reason to pay a search hop, so the full list is sent
+        even with the flag on."""
+        mock_tool_executor.has_deferrable_tools.return_value = False
+        ai = make_ai()
+        with patch(TOOL_SEARCH_ENABLED_PATCH, True), patch(
+            TOOL_SEARCH_MODE_PATCH, "load_tools"
+        ):
+            ai._get_tools()
+        mock_tool_executor.get_all_tools_openai_format.assert_called_once()
+        mock_tool_executor.get_visible_tools_openai_format.assert_not_called()
+
+    def test_unknown_mode_falls_back_to_load_tools(self, make_ai, mock_tool_executor):
+        mock_tool_executor.has_deferrable_tools.return_value = True
+        ai = make_ai()
+        with patch(TOOL_SEARCH_ENABLED_PATCH, True), patch(
+            TOOL_SEARCH_MODE_PATCH, "bogus"
+        ):
+            ai._get_tools()
+        mock_tool_executor.get_visible_tools_openai_format.assert_called_once()
+
+
+class TestToolSearchAnthropicMode:
+    """HOLMES_TOOL_SEARCH_MODE=anthropic: prepend Anthropic's search tool and mark
+    only the deferrable tools defer_loading."""
+
+    def _setup(self, mock_tool_executor, mock_llm, deferrable, tools):
+        mock_tool_executor.has_deferrable_tools.return_value = bool(deferrable)
+        mock_tool_executor.get_deferrable_tool_names.return_value = deferrable
+        mock_tool_executor.get_all_tools_openai_format.return_value = tools
+        # mock_llm is spec'd to LLM, so attach the helper explicitly.
+        mock_llm._is_anthropic_model = MagicMock(return_value=True)
+
+    def test_prepends_search_tool_and_defers_only_mcp_tools(
+        self, make_ai, mock_tool_executor, mock_llm
+    ):
+        self._setup(
+            mock_tool_executor,
+            mock_llm,
+            deferrable=["search_dashboards"],
+            tools=[_anthropic_tool("kubectl_get"), _anthropic_tool("search_dashboards")],
+        )
+        ai = make_ai()
+        with patch(TOOL_SEARCH_ENABLED_PATCH, True), patch(
+            TOOL_SEARCH_MODE_PATCH, "anthropic"
+        ):
+            result = ai._get_tools()
+
+        assert result[0]["type"] == "tool_search_tool_regex_20251119"
+        assert result[0]["name"] == "tool_search_tool_regex"
+        by_name = {t["function"]["name"]: t for t in result[1:]}
+        assert "defer_loading" not in by_name["kubectl_get"]
+        assert by_name["search_dashboards"]["defer_loading"] is True
+        assert len(result) == 3  # 1 search tool + 2 real tools
+
+    def test_does_not_mutate_the_executors_dicts(
+        self, make_ai, mock_tool_executor, mock_llm
+    ):
+        tools = [_anthropic_tool("search_dashboards")]
+        self._setup(
+            mock_tool_executor, mock_llm, deferrable=["search_dashboards"], tools=tools
+        )
+        ai = make_ai()
+        with patch(TOOL_SEARCH_ENABLED_PATCH, True), patch(
+            TOOL_SEARCH_MODE_PATCH, "anthropic"
+        ):
+            ai._get_tools()
+        assert "defer_loading" not in tools[0]
+
+    def test_never_defers_every_tool(self, make_ai, mock_tool_executor, mock_llm):
+        """Anthropic 400s with "All tools cannot be deferred", so when every tool is
+        deferrable one must stay eagerly loaded."""
+        self._setup(
+            mock_tool_executor,
+            mock_llm,
+            deferrable=["a", "b"],
+            tools=[_anthropic_tool("a"), _anthropic_tool("b")],
+        )
+        ai = make_ai()
+        with patch(TOOL_SEARCH_ENABLED_PATCH, True), patch(
+            TOOL_SEARCH_MODE_PATCH, "anthropic"
+        ):
+            result = ai._get_tools()
+        deferred = [t for t in result[1:] if t.get("defer_loading")]
+        assert len(deferred) == 1
+
+    def test_skipped_for_non_anthropic_models(
+        self, make_ai, mock_tool_executor, mock_llm
+    ):
+        self._setup(
+            mock_tool_executor,
+            mock_llm,
+            deferrable=["search_dashboards"],
+            tools=[_anthropic_tool("search_dashboards")],
+        )
+        mock_llm._is_anthropic_model = MagicMock(return_value=False)
+        ai = make_ai()
+        with patch(TOOL_SEARCH_ENABLED_PATCH, True), patch(
+            TOOL_SEARCH_MODE_PATCH, "anthropic"
+        ):
+            result = ai._get_tools()
+        assert result[0]["type"] == "function"
+        assert all("defer_loading" not in t for t in result)
+
+
+class TestLoadToolsHandling:
+    def test_load_tools_loads_matches(self, make_ai, mock_tool_executor):
+        mock_tool_executor.search_deferred_tools.return_value = [
+            "search_dashboards",
+            "kb_search",
+        ]
+        mock_tool_executor.get_tool_by_name.return_value = None
+        ai = make_ai()
+
+        result = ai._handle_load_tools("tc1", {"query": "grafana"})
+
+        assert ai._loaded_tool_names == {"search_dashboards", "kb_search"}
+        assert result.tool_call_id == "tc1"
+        assert result.tool_name == "load_tools"
+        assert result.result.status == StructuredToolResultStatus.SUCCESS
+        assert "search_dashboards" in result.result.data
+
+    def test_load_tools_with_no_match(self, make_ai, mock_tool_executor):
+        mock_tool_executor.search_deferred_tools.return_value = []
+        ai = make_ai()
+
+        result = ai._handle_load_tools("tc2", {"query": "zzz"})
+
+        assert ai._loaded_tool_names == set()
+        assert result.result.status == StructuredToolResultStatus.SUCCESS
+        assert "No tools matched" in result.result.data
+
+    def test_server_search_call_is_absorbed(self, make_ai, mock_tool_executor):
+        """litellm 1.89.0 converts Anthropic's server-side search into a client tool
+        call; it must not be routed to the ToolExecutor as a missing tool."""
+        ai = make_ai()
+        result = ai._handle_server_search_tool_call(
+            "tc3", "tool_search_tool_regex", {"pattern": "grafana"}
+        )
+        assert result.result.status == StructuredToolResultStatus.SUCCESS
+        mock_tool_executor.get_tool_by_name.assert_not_called()
+
+    def test_reset_interaction_state_clears_loaded_tools(self, make_ai):
+        ai = make_ai()
+        ai._loaded_tool_names = {"search_dashboards"}
+        ai.reset_interaction_state()
+        assert ai._loaded_tool_names == set()
+
+    def test_loaded_tools_survive_a_clone(self, make_ai):
+        """with_executor() is how an approval resume rebuilds the agent, so the tools
+        already loaded in the turn must carry over -- as a copy, not a shared set."""
+        ai = make_ai()
+        ai._loaded_tool_names = {"search_dashboards"}
+
+        clone = ai.with_executor(MagicMock(spec=ToolExecutor))
+
+        assert clone._loaded_tool_names == {"search_dashboards"}
+        clone._loaded_tool_names.add("kb_search")
+        assert "kb_search" not in ai._loaded_tool_names
+
+    @patch(LIMIT_PATCH, side_effect=_make_context_limiter_passthrough)
+    def test_stray_server_search_call_does_not_break_the_turn(
+        self, _mock_limit, make_ai, mock_llm, mock_tool_executor
+    ):
+        """litellm 1.89.0 converts Anthropic's server_tool_use search block into an
+        ordinary client tool_use, so the loop is handed a call for a tool no toolset
+        owns. Verified against the real litellm 1.89.0 transformation. Without the
+        absorb path this came back as "Failed to find tool tool_search_tool_regex";
+        the turn must still reach a final answer.
+        """
+        stray = _make_mock_tool_call(
+            tool_call_id="srvtoolu_1",
+            tool_name="tool_search_tool_regex",
+            arguments={"pattern": "grafana"},
+        )
+        mock_llm.completion.side_effect = [
+            _make_llm_response(content="searching", tool_calls=[stray]),
+            _make_llm_response(content="All good", tool_calls=None),
+        ]
+        ai = make_ai()
+        result = ai.call([{"role": "user", "content": "check grafana"}])
+
+        assert result.result == "All good"
+        # Never routed to the executor, so no "Failed to find tool" result.
+        mock_tool_executor.get_tool_by_name.assert_not_called()
+
+    @patch(LIMIT_PATCH, side_effect=_make_context_limiter_passthrough)
+    def test_load_tools_intercepted_during_invocation(
+        self, _mock_limit, make_ai, mock_llm, mock_tool_executor
+    ):
+        """A load_tools call is executed by Holmes itself, updates the loaded set, and
+        the loop continues to a final answer."""
+        load_tools_tc = _make_mock_tool_call(
+            tool_call_id="tc_load", tool_name="load_tools", arguments={"query": "grafana"}
+        )
+        mock_llm.completion.side_effect = [
+            _make_llm_response(content="searching", tool_calls=[load_tools_tc]),
+            _make_llm_response(content="Found tools", tool_calls=None),
+        ]
+        mock_tool_executor.search_deferred_tools.return_value = ["search_dashboards"]
+        mock_tool_executor.get_tool_by_name.return_value = None
+
+        ai = make_ai()
+        result = ai.call([{"role": "user", "content": "find grafana tools"}])
+
+        mock_tool_executor.search_deferred_tools.assert_called_once()
+        assert ai._loaded_tool_names == {"search_dashboards"}
+        assert result.result == "Found tools"

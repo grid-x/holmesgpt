@@ -23,9 +23,16 @@ from holmes.common.env_vars import (
     LOG_LLM_USAGE_RESPONSE,
     RESET_REPEATED_TOOL_CALL_CHECK_AFTER_COMPACTION,
     TEMPERATURE,
+    TOOL_SEARCH_ENABLED,
+    TOOL_SEARCH_MODE,
     load_bool,
 )
 from holmes.core.llm import LLM
+from holmes.core.tool_search import (
+    ANTHROPIC_TOOL_SEARCH_TOOL,
+    LOAD_TOOLS_NAME,
+    is_server_search_tool_call,
+)
 from holmes.core.llm_usage import RequestStats
 from holmes.core.models import (
     FrontendToolResult,
@@ -298,6 +305,10 @@ class ToolCallingLLM:
         self.llm = llm
         self.tool_results_dir = tool_results_dir
 
+        # Deferred (held-back) tools the model has loaded via load_tools in this
+        # conversation. Heavy tool schemas stay out of context until loaded.
+        self._loaded_tool_names: set[str] = set()
+
     def with_executor(self, tool_executor: ToolExecutor) -> "ToolCallingLLM":
         """Return a shallow copy with a different ToolExecutor.
 
@@ -311,14 +322,18 @@ class ToolCallingLLM:
             tool_results_dir=self.tool_results_dir,
             tracer=self.tracer,
         )
+        # Carry tool-search state so a resumed turn (e.g. after an approval pause,
+        # which clones via with_executor) keeps the tools it already loaded. A copy,
+        # not a shared reference: the clone must not mutate this instance's set.
+        clone._loaded_tool_names = set(self._loaded_tool_names)
         return clone
 
     def reset_interaction_state(self) -> None:
         """
-        For interactive loop. No transient per-interaction state is currently
-        tracked, but this hook is kept for the interactive loop to call.
+        For the interactive loop: drop transient per-conversation state so a new
+        conversation starts fresh (currently the tool-search loaded set).
         """
-        return None
+        self._loaded_tool_names.clear()
 
     def _supports_vision(self) -> bool:
         """Check if vision/multimodal input is enabled.
@@ -686,11 +701,62 @@ class ToolCallingLLM:
 
         If a user_id is available (from request_context), per-user OAuth tools
         replace _connect placeholders for authenticated users.
+
+        With HOLMES_TOOL_SEARCH_ENABLED, deferrable (by default MCP) tool schemas are
+        held back so they don't sit in the prompt on every turn. Two strategies, see
+        holmes/core/tool_search.py:
+          - "load_tools" (default): the held-back tools are replaced by a single
+            load_tools function tool that Holmes executes itself. The agent loop
+            re-fetches tools each step, so newly loaded tools appear on the next one.
+          - "anthropic": Anthropic's server-side tool-search tool is prepended and the
+            deferrable tools are marked defer_loading so Claude searches them itself.
         """
         user_id = (self._request_context or {}).get("user_id") if hasattr(self, "_request_context") else None
+        if TOOL_SEARCH_ENABLED and self.tool_executor.has_deferrable_tools():
+            if TOOL_SEARCH_MODE == "anthropic":
+                return self._get_tools_anthropic_search(user_id)
+            if TOOL_SEARCH_MODE != "load_tools":
+                logging.warning(
+                    f"Unknown HOLMES_TOOL_SEARCH_MODE={TOOL_SEARCH_MODE!r}, "
+                    "falling back to 'load_tools'"
+                )
+            return self.tool_executor.get_visible_tools_openai_format(
+                self._loaded_tool_names,
+                user_id=user_id,
+            )
         return self.tool_executor.get_all_tools_openai_format(
             user_id=user_id,
         )
+
+    def _get_tools_anthropic_search(self, user_id: Optional[str]) -> list:
+        """Anthropic server-side tool search: prepend the search tool and mark the
+        deferrable tools defer_loading, so Claude loads only what it needs.
+
+        Only deferrable tools are deferred, never the whole list: Anthropic rejects a
+        request in which every tool is deferred ("All tools cannot be deferred"), and
+        keeping built-ins loaded means common operations skip the search hop.
+
+        Requires an Anthropic-family model; for anything else the flag is ignored
+        rather than sending a tool type the provider will reject.
+        """
+        tools = self.tool_executor.get_all_tools_openai_format(user_id=user_id)
+        if not tools or not self.llm._is_anthropic_model():
+            return tools
+        deferrable = set(self.tool_executor.get_deferrable_tool_names())
+        deferred_count = 0
+        out: list = [ANTHROPIC_TOOL_SEARCH_TOOL]
+        for tool_def in tools:
+            name = (tool_def.get("function") or {}).get("name")
+            if name in deferrable:
+                # Copy: the executor hands back freshly built dicts today, but this
+                # must not depend on that.
+                tool_def = {**tool_def, "defer_loading": True}
+                deferred_count += 1
+            out.append(tool_def)
+        if deferred_count == len(tools):
+            # Every tool deferred -> Anthropic 400s. Load the first one eagerly.
+            out[1] = {k: v for k, v in out[1].items() if k != "defer_loading"}
+        return out
 
     @sentry_sdk.trace
     def call(  # type: ignore
@@ -984,6 +1050,75 @@ class ToolCallingLLM:
             metadata=metadata,
         )
 
+    def _handle_load_tools(
+        self, tool_call_id: str, tool_params: Dict[str, Any]
+    ) -> ToolCallResult:
+        """Execute the load_tools meta-tool: find held-back tools matching the query
+        and mark them loaded, so the next agent step can call them."""
+        query = (tool_params or {}).get("query", "") or ""
+        matched = self.tool_executor.search_deferred_tools(query)
+        self._loaded_tool_names.update(matched)
+        if matched:
+            lines = []
+            for name in matched:
+                tool = self.tool_executor.get_tool_by_name(name)
+                desc = ""
+                if tool and tool.description:
+                    desc = tool.description.strip().splitlines()[0]
+                lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+            data = (
+                f"Loaded {len(matched)} tool(s) matching '{query}'. They are now "
+                "available -- call them directly on your next step:\n" + "\n".join(lines)
+            )
+        else:
+            data = (
+                f"No tools matched '{query}'. Try broader keywords or an integration "
+                "name."
+            )
+        logging.info(f"load_tools(query={query!r}) -> {matched}")
+        return ToolCallResult(
+            tool_call_id=tool_call_id,
+            tool_name=LOAD_TOOLS_NAME,
+            description=f"load_tools(query={query!r})",
+            result=StructuredToolResult(
+                status=StructuredToolResultStatus.SUCCESS,
+                data=data,
+                params=tool_params,
+            ),
+        )
+
+    def _handle_server_search_tool_call(
+        self, tool_call_id: str, tool_name: str, tool_params: Dict[str, Any]
+    ) -> ToolCallResult:
+        """Absorb a provider-side tool-search call that reached the agent loop.
+
+        With HOLMES_TOOL_SEARCH_MODE=anthropic, the litellm SDK pinned here (1.89.0)
+        converts Anthropic's server_tool_use search block into an ordinary client
+        tool_use, so the loop is handed a call for a tool no toolset owns. Without
+        this it would come back as "Failed to find tool tool_search_tool_regex".
+        Returning a benign result keeps the turn alive (the deferred tools Claude
+        asked for are loaded server-side anyway) at the cost of one wasted hop.
+        Remove once litellm carries BerriAI/litellm#46440.
+        """
+        logging.warning(
+            f"Provider-side tool search surfaced as a client tool call ({tool_name}); "
+            "absorbing it. This means litellm is converting server_tool_use into a "
+            "client tool_use -- see holmes/core/tool_search.py."
+        )
+        return ToolCallResult(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            description=f"{tool_name}({tool_params})",
+            result=StructuredToolResult(
+                status=StructuredToolResultStatus.SUCCESS,
+                data=(
+                    "Tool search ran on the provider side. The tools it matched are "
+                    "available to call directly on your next step."
+                ),
+                params=tool_params,
+            ),
+        )
+
     def _invoke_llm_tool_call(
         self,
         tool_to_call: ChatCompletionMessageToolCall,
@@ -1031,6 +1166,21 @@ class ToolCallingLLM:
                 logging.warning(
                     f"Failed to parse arguments for tool: {tool_name}. args: {tool_arguments}"
                 )
+
+            # Tool-search meta-tools are owned by Holmes, not by any toolset, so they
+            # are handled here and never reach the ToolExecutor (which would report
+            # "Failed to find tool"). load_tools must also update the loaded set before
+            # the next _get_tools() re-fetch exposes what it loaded.
+            if tool_name == LOAD_TOOLS_NAME:
+                tool_call_result = self._handle_load_tools(tool_id, tool_params)
+                ToolCallingLLM._log_tool_call_result(tool_span, tool_call_result)
+                return tool_call_result
+            if is_server_search_tool_call(tool_name):
+                tool_call_result = self._handle_server_search_tool_call(
+                    tool_id, tool_name, tool_params
+                )
+                ToolCallingLLM._log_tool_call_result(tool_span, tool_call_result)
+                return tool_call_result
 
             user_id = (request_context or {}).get("user_id")
             tool = self.tool_executor.get_tool_by_name(tool_name, user_id=user_id)
@@ -1642,8 +1792,17 @@ class ToolCallingLLM:
                 # Re-fetch tools if the tool list changed (skill activation, OAuth tool discovery, etc.)
                 if tools is not None:
                     new_tools = self._get_tools()
-                    old_names = {t["function"]["name"] for t in tools}
-                    new_names = {t["function"]["name"] for t in new_tools}
+                    # Key on the function name, but skip non-function entries: with tool
+                    # search the list also carries provider-side tool definitions (e.g.
+                    # Anthropic's search tool), which have no "function" key at all.
+                    old_names = {
+                        t["function"]["name"] for t in tools if t.get("type") == "function"
+                    }
+                    new_names = {
+                        t["function"]["name"]
+                        for t in new_tools
+                        if t.get("type") == "function"
+                    }
                     if old_names != new_names:
                         logging.warning(
                             f"Tool list changed - refreshing ({len(tools)} -> {len(new_tools)} tools)"

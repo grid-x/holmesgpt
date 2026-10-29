@@ -72,6 +72,22 @@ SENTRY_TRACES_SAMPLE_RATE = float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0
 
 EXTRA_HEADERS = os.environ.get("EXTRA_HEADERS", "")
 THINKING = os.environ.get("THINKING", "")
+# Tool search: hold heavy tool schemas out of the system prompt until the model asks
+# for them, instead of sending the whole catalog on every turn.
+TOOL_SEARCH_ENABLED = load_bool("HOLMES_TOOL_SEARCH_ENABLED", False)
+# Which strategy to use when tool search is enabled:
+#   "load_tools" (default) - Holmes exposes a load_tools function tool and runs the
+#       search itself. Works on every provider/gateway.
+#   "anthropic" - inject Anthropic's server-side tool-search tool and mark tools
+#       defer_loading. Needs a litellm that keeps tool_search_tool_result and does not
+#       turn server_tool_use into a client tool call (fixed upstream 2026-10-15,
+#       BerriAI/litellm#46440; not in any stable release as of litellm 1.106.6).
+TOOL_SEARCH_MODE = os.environ.get("HOLMES_TOOL_SEARCH_MODE", "load_tools").strip().lower()
+# Comma-separated toolset types whose tools are deferred. Defaults to MCP toolsets,
+# which dominate schema bloat; built-ins stay loaded so common ops skip the search hop.
+TOOL_SEARCH_DEFER_TYPES = os.environ.get("HOLMES_TOOL_SEARCH_DEFER_TYPES", "mcp")
+# Max number of tools a single load_tools call may load.
+TOOL_SEARCH_RESULT_LIMIT = int(os.environ.get("HOLMES_TOOL_SEARCH_RESULT_LIMIT", "8"))
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "").strip().lower()
 
 

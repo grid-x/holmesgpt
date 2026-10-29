@@ -24,6 +24,10 @@ from holmes.clients.robusta_client import (
     RobustaModelsResponse,
     fetch_robusta_models,
 )
+from holmes.core.tool_search import (
+    ANTHROPIC_TOOL_SEARCH_BETA_HEADER,
+    ANTHROPIC_TOOL_SEARCH_TYPE,
+)
 from holmes.common.env_vars import (
     AZURE_AD_TOKEN_AUTH,
     EXTRA_HEADERS,
@@ -732,6 +736,24 @@ class DefaultLLM(LLM):
 
         if EXTRA_HEADERS:
             self.args.setdefault("extra_headers", json.loads(EXTRA_HEADERS))
+
+        # Anthropic requires a beta header for its server-side tool search. litellm
+        # 1.89.0 auto-adds beta headers for web_fetch/memory/advisor tools but not for
+        # tool search, so add it here when the search tool is actually in the request.
+        # Merged into (not overwriting) any configured extra_headers.
+        if tools_args.get("tools") and any(
+            isinstance(t, dict) and t.get("type") == ANTHROPIC_TOOL_SEARCH_TYPE
+            for t in tools_args["tools"]
+        ):
+            headers = dict(self.args.get("extra_headers") or {})
+            existing = headers.get("anthropic-beta")
+            if not existing:
+                headers["anthropic-beta"] = ANTHROPIC_TOOL_SEARCH_BETA_HEADER
+            elif ANTHROPIC_TOOL_SEARCH_BETA_HEADER not in existing:
+                headers["anthropic-beta"] = (
+                    f"{existing},{ANTHROPIC_TOOL_SEARCH_BETA_HEADER}"
+                )
+            self.args["extra_headers"] = headers
 
         litellm.modify_params = True
 
