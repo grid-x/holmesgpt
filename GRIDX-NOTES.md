@@ -67,11 +67,18 @@ docs:
   handed a tool call named `tool_search_tool_regex` that no toolset owns, and the
   search result never enters history.
 
-Fixed upstream on 2026-10-15 (BerriAI/litellm#46440, #46389), but that is only in
-`v1.107.0` pre-releases — no stable litellm carries it (latest stable at the time
-of writing: 1.106.6, still has the skip). Note this is the **SDK inside Holmes**,
-not the LiteLLM proxy version the gateway runs; a working `claude` CLI against
-`gateway.ai.gridx.de` says nothing about it.
+BerriAI/litellm#46440 (2026-10-15) fixes only the first half. Verified by running a
+tool-search response through `litellm==1.107.0rc2`: the `tool_search_tool_result`
+block now survives into `provider_specific_fields.tool_results`, but
+`server_tool_use` is **still** converted into a client tool call, so the stray
+`tool_search_tool_regex` call reaches the agent loop either way. And there is no
+stable 1.107.0 at all — latest stable is 1.106.6, which still has the skip, so
+1.107.0 exists only as `dev`/`rc`. Moving the pin there would mean shipping a
+release candidate (~250 commits past 1.106.6) for a partial fix, and the absorb
+shim below would still be required.
+
+Note this is the **SDK inside Holmes**, not the LiteLLM proxy version the gateway
+runs; a working `claude` CLI against `gateway.ai.gridx.de` says nothing about it.
 
 So `anthropic` mode is wired up and tested but gated behind the env var, and
 `_handle_server_search_tool_call` absorbs a stray search call so the mode degrades
@@ -88,6 +95,17 @@ Two further constraints found in the litellm docs and encoded here:
   when the search tool is in the request, merging into any configured `EXTRA_HEADERS`.
 
 ### What it does
+
+`HOLMES_TOOL_SEARCH_RESULT_LIMIT` defaults to 40, which must stay comfortably above
+any single MCP server's tool count. At the initial 8 (taken from upstream #2108), a
+`load_tools("buildkite")` against the 16-tool buildkite server returned the first 8
+alphabetically and reported "Loaded 8 tool(s)" with no indication it had truncated,
+leaving `list_jobs`/`read_logs`/`search_logs` unreachable. A withheld match is now
+always reported. Relatedly, a multi-word query is matched as OR across terms rather
+than as one regex: the model's natural recovery
+(`load_tools("buildkite list_jobs read_logs")`) is valid regex, so it was searched
+for as a literal phrase and matched nothing -- and being valid meant the
+invalid-regex substring fallback never fired.
 
 Only MCP toolsets are deferred by default (`HOLMES_TOOL_SEARCH_DEFER_TYPES`), so
 kubernetes/bash stay loaded and common operations skip the search hop. On a catalog
@@ -108,6 +126,14 @@ The 10 failures in a full `pytest tests/ --ignore=tests/llm` run are pre-existin
 this branch (MCP stdio tests needing a `python` binary, plus four unrelated toolset
 tests) — confirmed by re-running them with the change stashed.
 
-**Not verified against a live model.** No turn has been run through
-`gateway.ai.gridx.de` with either mode enabled, so the token saving above is measured
-on serialized schemas, not on a real turn's prompt tokens.
+**Live-model status.** `load_tools` mode has been exercised through
+`gateway.ai.gridx.de` (a buildkite investigation loaded tools on demand), which is
+how both search bugs above were found. The token saving is still measured on
+serialized schemas rather than a real turn's prompt-token count, and `anthropic` mode
+has never been run against a live model.
+
+Note also that every toolset in `holmesgpt-config/config.yaml` omits `type:`, so all
+of them -- including the custom `aws`/`redis`/`reporting`/`artifacts` ones -- resolve
+to `BUILTIN` via the default at `holmes/plugins/toolsets/__init__.py:251` and are
+therefore never deferred. Deferring those needs `type: custom` in the config *and*
+`HOLMES_TOOL_SEARCH_DEFER_TYPES=mcp,custom`; neither alone does anything.
