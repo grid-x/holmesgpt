@@ -888,6 +888,19 @@ class Toolset(BaseModel):
     # accepted values. Toolsets that don't support variants ignore this field.
     subtype: Optional[str] = None
 
+    # Per-toolset opt in/out of tool search (HOLMES_TOOL_SEARCH_ENABLED), which
+    # holds a toolset's tool schemas out of the prompt until the model asks for
+    # them via load_tools. None means "follow HOLMES_TOOL_SEARCH_DEFER_TYPES for
+    # my type"; True/False overrides it for this toolset alone.
+    #
+    # The type-wide default is too coarse on its own: a deployment's custom
+    # toolsets can mix ones that are situational (a cloud CLI wrapper) with ones
+    # used on nearly every turn (a kubernetes query toolset), and deferring the
+    # latter costs a round trip before any real work starts. The toolset's own
+    # llm_instructions stay in the system prompt either way, so a deferred
+    # toolset is still discoverable -- only its parameter schemas are withheld.
+    defer: Optional[bool] = None
+
     def override_with(self, override: "Toolset") -> None:
         """
         Overrides the current attributes with values from the Toolset loaded from custom config

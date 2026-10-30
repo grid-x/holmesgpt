@@ -63,6 +63,11 @@ class _SearchToolset(Toolset):
         self.tools = [_SearchTool(name=n, description=d) for n, d in tool_specs]
 
 
+def _enabled(ts: Toolset) -> Toolset:
+    ts.status = ToolsetStatusEnum.ENABLED
+    return ts
+
+
 def _executor_with_search() -> ToolExecutor:
     core = _SearchToolset(
         "kubernetes/core", ToolsetType.BUILTIN, [("kubectl_get", "get k8s resources")]
@@ -173,7 +178,82 @@ def test_nothing_is_deferrable_without_mcp_toolsets():
 def test_defer_types_are_configurable():
     ex = _executor_with_search()
     # With built-ins made deferrable, the MCP tools are the ones that stay loaded.
+    # NOTE: this fixture sets ToolsetType.BUILTIN explicitly. A built-in toolset
+    # *overridden from config* comes back with type=None instead and is never
+    # deferred by type -- see test_a_typeless_toolset_is_not_deferred_by_type.
     assert ex.get_deferrable_tool_names() == ["kubectl_get"]
     names = {t["function"]["name"] for t in ex.get_visible_tools_openai_format(set())}
     assert "kubectl_get" not in names
     assert "search_dashboards" in names
+
+
+@patch("holmes.core.tools_utils.tool_executor.TOOL_SEARCH_DEFER_TYPES", "built-in,custom,mcp")
+def test_a_typeless_toolset_is_not_deferred_by_type():
+    """A built-in toolset overridden in config resolves to type=None (verified
+    against holmesgpt-config: bash, prometheus/metrics and grafana/tempo all do).
+    Treating a missing type as deferrable would hold back exactly the toolsets
+    nearly every turn needs, so type matching requires a real type -- even with
+    every known type listed as deferrable.
+    """
+    ex = ToolExecutor(
+        toolsets=[_enabled(_SearchToolset("bash", None, [("run_bash", "run a command")]))]
+    )
+    assert ex.get_deferrable_tool_names() == []
+    assert not ex.has_deferrable_tools()
+
+
+class TestPerToolsetDeferOverride:
+    """`defer:` on a toolset overrides HOLMES_TOOL_SEARCH_DEFER_TYPES for that
+    toolset alone. The type-wide switch is too coarse by itself: a deployment's
+    custom toolsets mix situational ones (a cloud CLI wrapper) with ones used on
+    nearly every turn (a kubernetes query toolset)."""
+
+    def _executor(self):
+        return ToolExecutor(
+            toolsets=[
+                _enabled(
+                    _SearchToolset(
+                        "aws", ToolsetType.CUSTOMIZED, [("aws_s3_ls", "list buckets")],
+                        defer=True,
+                    )
+                ),
+                _enabled(
+                    _SearchToolset(
+                        "kubernetes", ToolsetType.CUSTOMIZED,
+                        [("kubernetes_count", "count resources")], defer=False,
+                    )
+                ),
+                _enabled(
+                    _SearchToolset(
+                        "grafana", ToolsetType.MCP, [("search_dashboards", "find")],
+                    )
+                ),
+            ]
+        )
+
+    def test_defer_true_overrides_a_non_deferrable_type(self):
+        # type=custom is not in the default DEFER_TYPES ("mcp"), but defer:true wins.
+        assert "aws_s3_ls" in self._executor().get_deferrable_tool_names()
+
+    def test_defer_false_overrides_a_deferrable_type(self):
+        with patch(
+            "holmes.core.tools_utils.tool_executor.TOOL_SEARCH_DEFER_TYPES",
+            "custom,mcp",
+        ):
+            deferred = self._executor().get_deferrable_tool_names()
+        assert "kubernetes_count" not in deferred  # pinned loaded despite its type
+        assert "search_dashboards" in deferred  # no override -> follows the type
+
+    def test_unset_defer_follows_the_type_default(self):
+        deferred = self._executor().get_deferrable_tool_names()
+        assert "search_dashboards" in deferred  # mcp is deferrable by default
+        assert "kubernetes_count" not in deferred
+
+    def test_a_pinned_toolset_stays_visible(self):
+        names = {
+            t["function"]["name"]
+            for t in self._executor().get_visible_tools_openai_format(set())
+        }
+        assert "kubernetes_count" in names
+        assert "aws_s3_ls" not in names
+        assert "search_dashboards" not in names

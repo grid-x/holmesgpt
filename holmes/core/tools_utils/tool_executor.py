@@ -234,9 +234,22 @@ class ToolExecutor:
     # -- Tool search (progressive disclosure) ---------------------------------
 
     def _is_deferrable(self, tool_name: str) -> bool:
-        """Whether a tool is held back from the default list until loaded on demand."""
+        """Whether a tool is held back from the default list until loaded on demand.
+
+        An explicit ``defer:`` on the owning toolset wins; otherwise the toolset's
+        type is matched against HOLMES_TOOL_SEARCH_DEFER_TYPES. A toolset with no
+        type is never deferred by type alone -- built-in overrides loaded from config
+        come back with ``type=None``, and inferring "defer it" from a missing type
+        would hold back bash/prometheus/kubernetes, which nearly every turn needs.
+        Such a toolset can still be deferred, but only by saying ``defer: true``.
+        """
         toolset = self._tool_to_toolset.get(tool_name)
         if toolset is None:
+            return False
+        explicit = getattr(toolset, "defer", None)
+        if explicit is not None:
+            return bool(explicit)
+        if toolset.type is None:
             return False
         ts_type = getattr(toolset.type, "value", toolset.type)
         return str(ts_type).lower() in _deferrable_toolset_types()
