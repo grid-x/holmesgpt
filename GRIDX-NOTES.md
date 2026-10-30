@@ -47,6 +47,18 @@ the Dockerfile commit is carried on inspection only (0.45.0 is still
 
 ## Tool search (`HOLMES_TOOL_SEARCH_ENABLED`)
 
+> **Status: evaluated, not adopted. This branch is deliberately NOT merged into
+> `gridx-0.45.0`.** It works, and it is off by default, but the saving lands on
+> trivial turns (~70k -> ~30k context on a bare "Hi") and is close to nothing on
+> large investigations, where context is dominated by tool results rather than
+> schemas -- which is where voyager's spend is. Two costs may also offset it:
+> every `load_tools` call is an extra round trip re-sending the whole context, and
+> changing the tool list mid-conversation invalidates the prompt-cache prefix
+> (unmeasured -- check `cache_read_input_tokens` before trusting token totals).
+> Full reasoning and the conditions for revisiting:
+> `docs/design/dynamic-tool-loading.md` in the voyager repo.
+
+
 Ported from upstream's two unmerged PRs — HolmesGPT/holmesgpt#2108 (client-side
 `load_tools`) and #2242 (Anthropic's server-side tool search) — because with the
 grafana/nexus/buildkite MCP servers enabled, the whole tool catalog is serialized
