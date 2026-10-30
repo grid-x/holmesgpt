@@ -132,8 +132,31 @@ how both search bugs above were found. The token saving is still measured on
 serialized schemas rather than a real turn's prompt-token count, and `anthropic` mode
 has never been run against a live model.
 
-Note also that every toolset in `holmesgpt-config/config.yaml` omits `type:`, so all
-of them -- including the custom `aws`/`redis`/`reporting`/`artifacts` ones -- resolve
-to `BUILTIN` via the default at `holmes/plugins/toolsets/__init__.py:251` and are
-therefore never deferred. Deferring those needs `type: custom` in the config *and*
-`HOLMES_TOOL_SEARCH_DEFER_TYPES=mcp,custom`; neither alone does anything.
+### Choosing what gets deferred
+
+`type:` is never written by hand; `toolset_manager.py` assigns it. Everything under
+`mcp_servers:` is stamped `mcp` (line 103), and any `toolsets:` entry whose name is
+not a built-in gets `custom` (line 425). Resolved against
+`holmesgpt-config/config.yaml`:
+
+| toolset | type |
+|---|---|
+| `aws`, `redis`, `reporting`, `artifacts`, `kubernetes` | `custom` |
+| `grafana`, `buildkite`, `nexus` | `mcp` |
+| `bash`, `prometheus/metrics`, `grafana/tempo`, `kubernetes/*` | `None` (built-in override) |
+
+Two consequences. A built-in overridden from config carries **no** type, so type
+matching deliberately requires a real type -- inferring "defer it" from a missing one
+would hold back bash/prometheus/tempo, which nearly every turn needs. And
+`HOLMES_TOOL_SEARCH_DEFER_TYPES=mcp,custom` is blunt here: it would sweep in
+`kubernetes` (used constantly) alongside `aws` (situational), because both are
+`custom`.
+
+So a toolset can carry `defer: true` / `defer: false` to override the type-wide
+default for itself alone. `defer: true` on `aws` defers it without touching
+`kubernetes`; `defer: false` pins a toolset loaded whatever the env var says. A
+deferred toolset keeps its `llm_instructions` in the system prompt -- those render
+from the toolset list, not the tool list -- so it stays discoverable; only the
+parameter schemas are withheld. A toolset with no `llm_instructions` would be
+genuinely invisible once deferred, which is worth remembering when adding MCP
+servers.

@@ -187,7 +187,10 @@ def test_defer_types_are_configurable():
     assert "search_dashboards" in names
 
 
-@patch("holmes.core.tools_utils.tool_executor.TOOL_SEARCH_DEFER_TYPES", "built-in,custom,mcp")
+@patch(
+    "holmes.core.tools_utils.tool_executor.TOOL_SEARCH_DEFER_TYPES",
+    "built-in,custom,mcp",
+)
 def test_a_typeless_toolset_is_not_deferred_by_type():
     """A built-in toolset overridden in config resolves to type=None (verified
     against holmesgpt-config: bash, prometheus/metrics and grafana/tempo all do).
@@ -196,7 +199,9 @@ def test_a_typeless_toolset_is_not_deferred_by_type():
     every known type listed as deferrable.
     """
     ex = ToolExecutor(
-        toolsets=[_enabled(_SearchToolset("bash", None, [("run_bash", "run a command")]))]
+        toolsets=[
+            _enabled(_SearchToolset("bash", None, [("run_bash", "run a command")]))
+        ]
     )
     assert ex.get_deferrable_tool_names() == []
     assert not ex.has_deferrable_tools()
@@ -213,19 +218,25 @@ class TestPerToolsetDeferOverride:
             toolsets=[
                 _enabled(
                     _SearchToolset(
-                        "aws", ToolsetType.CUSTOMIZED, [("aws_s3_ls", "list buckets")],
+                        "aws",
+                        ToolsetType.CUSTOMIZED,
+                        [("aws_s3_ls", "list buckets")],
                         defer=True,
                     )
                 ),
                 _enabled(
                     _SearchToolset(
-                        "kubernetes", ToolsetType.CUSTOMIZED,
-                        [("kubernetes_count", "count resources")], defer=False,
+                        "kubernetes",
+                        ToolsetType.CUSTOMIZED,
+                        [("kubernetes_count", "count resources")],
+                        defer=False,
                     )
                 ),
                 _enabled(
                     _SearchToolset(
-                        "grafana", ToolsetType.MCP, [("search_dashboards", "find")],
+                        "grafana",
+                        ToolsetType.MCP,
+                        [("search_dashboards", "find")],
                     )
                 ),
             ]
