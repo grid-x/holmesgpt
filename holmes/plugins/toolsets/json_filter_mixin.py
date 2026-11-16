@@ -42,15 +42,35 @@ def _truncate_to_depth(value: Any, max_depth: Optional[int], current_depth: int 
 
 
 def _apply_jq_filter(data: Any, expression: str) -> Tuple[Optional[Any], Optional[str]]:
+    # Compile and run are reported separately on purpose. Labelling both
+    # "Invalid jq expression" told the LLM to rewrite its filter when the filter
+    # was correct and the DATA was the problem -- `fromjson` on output with
+    # leading control bytes, `@base64d` on a non-base64 string. The rewrite then
+    # fails identically, and each attempt costs a full tool call (for a device
+    # command, a ~90s round-trip whose result this function discards).
     try:
         compiled = jq.compile(expression)
-        matches = compiled.input(data).all()
-        if len(matches) == 1:
-            return matches[0], None
-        return matches, None
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Failed to apply jq filter", exc_info=exc)
+    except Exception as exc:
+        logger.debug("Failed to compile jq filter", exc_info=exc)
         return None, f"Invalid jq expression: {exc}"
+
+    try:
+        matches = compiled.input(data).all()
+    except Exception as exc:
+        logger.debug("Failed to apply jq filter", exc_info=exc)
+        return None, (
+            f"The jq expression compiled but failed on this response's data: {exc}. "
+            "The expression's syntax is valid, so rewriting it the same way will "
+            "fail again. This usually means the data is not the shape the filter "
+            "assumed -- e.g. `fromjson` on output that does not start with `[`/`{` "
+            "(strip it first: `gsub(\"[[:cntrl:]]\"; \"\") | sub(\"^[^[{]*\"; \"\")`), "
+            "`@base64d` on a value that is not base64, or indexing a different type. "
+            "Inspect the raw value before filtering it again."
+        )
+
+    if len(matches) == 1:
+        return matches[0], None
+    return matches, None
 
 
 class JsonFilterMixin:
