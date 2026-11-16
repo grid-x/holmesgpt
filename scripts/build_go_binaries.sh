@@ -1,9 +1,18 @@
 #!/bin/bash
 # Build CVE-patched Go binaries for the holmes Docker image.
 #
-# All binaries built by this script are built with Go 1.26.9 to fix the stdlib
+# All binaries built by this script are built with Go 1.27.3 to fix the stdlib
 # batch CVE-2026-33818/56853/56858/56859/56860/56862 plus CVE-2026-39821/46600
-# (all High, fixed in Go 1.26.6), plus the Go 1.26.9 stdlib batch.
+# (all High, fixed in Go 1.26.6), plus the later 1.26.x and 1.27.x stdlib
+# batches. 1.27.3 is a strict superset of the 1.26.9 fixes this pin previously
+# carried: Go backports each security fix to the two most recent minor lines
+# simultaneously, so 1.27.x never trails 1.26.x.
+#
+# Raised from 1.26.9 because fr-decode's go.mod declares `go 1.27.3`, and a
+# GOTOOLCHAIN below a module's own go directive fails the build outright
+# ("go.mod requires go >= 1.27.3"). Raising it for ALL four binaries rather
+# than making fr-decode an exception keeps one floor to reason about -- the
+# other three build clean on it (verified).
 #
 # Two x/* replaces are applied to every binary that pulls them in, because the
 # same advisories hit all of them:
@@ -54,7 +63,7 @@
 #   Go >= 1.26.6, grpc >= 1.83.2, x/crypto >= 0.56.0 and oras-go >= 2.6.2.
 #
 # kubectl: rebuilt from source with x/net v0.60.0 / x/text v0.42.0 and Go
-#   1.26.9. The latest release (v1.37.1) ships Go 1.26.8 / x/net v0.57.0 /
+#   1.27.3. The latest release (v1.37.1) ships Go 1.26.8 / x/net v0.57.0 /
 #   x/text v0.40.0. Revert to the official binary once a release has them.
 #   golang.org/x/text -> v0.42.0 on every binary (High, fixed 0.41.0;
 #   x/net v0.60.0 requires 0.42.0).
@@ -72,7 +81,8 @@
 #   The GOTOOLCHAIN pin above still applies and is the one thing enforced here:
 #   Microwave's go.mod says `go 1.26.3`, which is below this file's stdlib
 #   floor, so building it with the pinned toolchain costs nothing and keeps the
-#   stdlib CVEs closed.
+#   stdlib CVEs closed. (A go directive BELOW the pin is fine -- only one above
+#   it fails, which is what raised the pin to 1.27.3 for fr-decode.)
 #
 #   What that leaves open, stated plainly rather than waved off: at v1.10.0
 #   Microwave vendors x/net 0.55.0, x/text 0.37.0 and grpc 1.81.1, below the
@@ -84,6 +94,19 @@
 #   peer -- and the fix is a dep bump in Microwave:
 #     go get golang.org/x/net@v0.60.0 golang.org/x/text@v0.42.0 \
 #            google.golang.org/grpc@v1.83.2 && go mod tidy && go mod vendor
+#
+# fr-decode: built AS-IS from a local checkout of the private grid-x/fr-decode
+#   (FR_DECODE_SRC), same reasoning as Microwave -- gridX-owned, so dep bumps
+#   belong in its own go.mod. It has exactly one dependency
+#   (github.com/klauspost/compress) and no x/net, x/crypto, x/text or grpc in
+#   its graph at all, so the replaces above have nothing to apply to.
+#   It turns a flight recording into newline-delimited JSON for Voyager's
+#   flight-recordings toolset, which pipes it into jq. Replaces a Python port
+#   of the same format that Voyager used to carry -- one implementation of a
+#   binary format instead of two that can silently drift.
+#   Its go.mod requires `go 1.27.3`, which is what raised the GOTOOLCHAIN pin
+#   above; verified byte-identical output to the Python port on a real
+#   recording (11,712 records).
 #
 # Known findings left in the image (no upstream fix exists):
 #   GO-2026-5932  (x/crypto/openpgp) — the package is unmaintained by design.
@@ -100,10 +123,11 @@ set -euo pipefail
 # CVE-2026-33818/56853/56858/56859/56860/56862 plus CVE-2026-39821/46600, on
 # top of the earlier fixes in 1.26.3/1.26.5. Go auto-downloads it if the
 # locally installed go is older (requires local go >= 1.21).
-# Go 1.26.9: stdlib CVE fixes over 1.26.6/1.26.7.
-export GOTOOLCHAIN=go1.26.9
+# Go 1.27.3: the 1.27-line equivalent, and the floor fr-decode's go.mod
+# requires. See the header for why this is one pin rather than a per-tool one.
+export GOTOOLCHAIN=go1.27.3
 
-MIN_GO_VERSION="1.26.9"
+MIN_GO_VERSION="1.27.3"
 # Minimum *local* Go that can bootstrap the GOTOOLCHAIN auto-download above
 # (the GOTOOLCHAIN mechanism landed in Go 1.21). Intentionally lower than
 # MIN_GO_VERSION: the pinned build toolchain is fetched automatically, so the
@@ -182,6 +206,11 @@ MONGO_DRIVER_PATCHED_VERSION=v1.17.7
 # build echoes `git describe` so the build log records what went in; keep the
 # checkout at a release tag unless you are deliberately testing newer work.
 MICROWAVE_SRC="${MICROWAVE_SRC:-$HOME/go/github.com/grid-x/Microwave}"
+# fr-decode (grid-x, PRIVATE) decodes a flight recording to NDJSON. Same
+# local-checkout reasoning as Microwave above. Unlike Microwave it is NOT
+# vendored, so the build needs a warm module cache or the network for its one
+# dependency -- it is not forced offline for that reason.
+FR_DECODE_SRC="${FR_DECODE_SRC:-$HOME/go/github.com/grid-x/fr-decode}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 OUTDIR="$REPO_ROOT/bin/go-cve-rebuild"
@@ -304,9 +333,35 @@ for arch in amd64 arm64; do
     -o "$OUTDIR/$arch/microwave" ./cmd/microwave
 done
 
+# fr-decode: built as-is from $FR_DECODE_SRC, like Microwave. Not vendored, so
+# no GOPROXY=off here -- its single dependency has to come from the module
+# cache or the proxy.
+if [ ! -d "$FR_DECODE_SRC" ]; then
+  echo "ERROR: FR_DECODE_SRC=$FR_DECODE_SRC is not a directory." >&2
+  echo "Clone the private repo grid-x/fr-decode and set FR_DECODE_SRC to it." >&2
+  exit 1
+fi
+if [ ! -f "$FR_DECODE_SRC/main.go" ]; then
+  echo "ERROR: $FR_DECODE_SRC does not look like grid-x/fr-decode (no main.go)." >&2
+  exit 1
+fi
+
+FR_DECODE_DESCRIBE="$(cd "$FR_DECODE_SRC" && git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+echo "==> Building fr-decode from $FR_DECODE_SRC ($FR_DECODE_DESCRIBE)..."
+cd "$FR_DECODE_SRC"
+
+# Output name is `decode`, matching the repo's own README and PROMPT.md, which
+# Voyager's toolset instructions point the model at.
+for arch in amd64 arm64; do
+  echo "==> Building fr-decode for linux/$arch..."
+  CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build \
+    -ldflags "-w -s" \
+    -o "$OUTDIR/$arch/decode" .
+done
+
 echo "==> Compressing binaries..."
 for arch in amd64 arm64; do
-  for f in argocd helm kubectl microwave; do
+  for f in argocd helm kubectl microwave decode; do
     gzip -f "$OUTDIR/$arch/$f"
   done
 done
@@ -319,7 +374,7 @@ else
   SHA256_CMD="shasum -a 256"
 fi
 for arch in amd64 arm64; do
-  (cd "$OUTDIR/$arch" && for f in argocd.gz helm.gz kubectl.gz microwave.gz; do
+  (cd "$OUTDIR/$arch" && for f in argocd.gz helm.gz kubectl.gz microwave.gz decode.gz; do
     $SHA256_CMD "$f" > "$f.sha256"
   done)
 done

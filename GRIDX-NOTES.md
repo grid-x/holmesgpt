@@ -17,6 +17,7 @@ Rebased from `fix/bash-argv-flag-aware-validation` (which sat on 0.42.0).
 | `fix: don't crash on an explicit "tool_calls": null when a turn pauses` | tool approval |
 | `fix(jq): stop reporting a data error as an invalid jq expression` | see below |
 | `chore: add microwave to the image for flight recordings` | see below |
+| `chore: add fr-decode, raise the Go toolchain pin to 1.27.3` | see below |
 
 `json_filter_mixin._apply_jq_filter` labelled every failure "Invalid jq
 expression", including failures where the filter compiled fine and the DATA was
@@ -90,6 +91,52 @@ the shipped binary was run there against a live recording — `-f human` gives
 `[eb4303.. (Inv,Battery)]` through `BatteryFuseLimits ph1`, `-f contracts`
 returns its `SoftBreach` report. The Dockerfile stanza itself is carried on
 inspection, like the rest of that commit.
+
+## fr-decode in the image, and the 1.27.3 toolchain pin
+
+`decode` (private `grid-x/fr-decode`) turns a flight recording into
+newline-delimited JSON, which Voyager's `flight-recordings` toolset pipes into
+jq. It is here to **delete a fork**: Voyager previously carried a Python port of
+the same binary format, written because this image had no Go toolchain and is
+vendored rather than built by us. Both produced byte-identical output on a real
+recording (11,712 records, `cmp` clean), so the port was never wrong — it was
+simply a second implementation of a binary format that could drift. One
+implementation, owned by the team that owns the format.
+
+Performance was not the reason and does not favour either: decode alone is 63ms
+(Go) vs 89ms (Python), but end-to-end with jq both land at ~2.1s, because jq
+dominates. Built as-is from a local checkout (`FR_DECODE_SRC`), same reasoning
+as Microwave. Its whole module graph is `github.com/klauspost/compress` — no
+x/net, x/crypto, x/text or grpc at all (verified with `go list -m all`), so the
+replaces in that script have nothing to apply to. It is not vendored, so its
+build is the one that still wants a module cache or the proxy.
+
+**The GOTOOLCHAIN pin rose from 1.26.9 to 1.27.3 for this.** fr-decode's
+`go.mod` declares `go 1.27.3`, and a toolchain below a module's own go
+directive fails outright (`go.mod requires go >= 1.27.3`) — a directive *below*
+the pin is fine, which is why Microwave's `go 1.26.3` never needed this. The
+pin was raised for **all** binaries rather than making fr-decode an exception,
+so there is one floor to reason about rather than per-tool ones. 1.27.3 is a
+strict superset of 1.26.9's stdlib fixes: Go backports each security fix to the
+two most recent minor lines together, so the 1.27 line never trails 1.26.
+
+**Verified before raising it:** argocd v3.3.15, helm v3.22.0 and kubectl
+v1.37.1 were each rebuilt from source on Go 1.27.3 with their full replace sets
+applied, and all three compile clean. fr-decode itself builds in ~3s for both
+arches (974 KB amd64 / 880 KB arm64 gzipped), leaves the checkout clean, and
+its smoke test (`decode 2>&1 | grep -q "usage: decode"` — a bare call exits 2
+with usage on stderr) passes inside the 0.45.0 image. The full toolset was then
+run there against a live recording through all three of its formats.
+
+**Known gap, deliberate:** only `decode` is actually built with 1.27.3. The
+four binaries already committed (`argocd`, `helm`, `kubectl`, `microwave`)
+remain as built with 1.26.9 — rebuilding them was deferred to the next CVE pass
+rather than enlarging this change. So the script's pin is ahead of four of the
+five shipped artifacts. That is cosmetic for now (1.26.9 carries every fix this
+script documents, and all three externals were verified to compile on 1.27.3),
+but **the next run of the script will rebuild all five on 1.27.3**, which is
+when the tree catches up. Do not read the committed binaries as evidence of
+what the pin produces until then.
 
 ## Why the two bash commits were not replayed
 

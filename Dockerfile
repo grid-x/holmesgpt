@@ -73,6 +73,16 @@ RUN cd /tmp && sha256sum -c microwave.gz.sha256 \
     && gunzip /tmp/microwave.gz && mv /tmp/microwave /microwave && chmod +x /microwave \
     && rm -f /tmp/microwave.gz.sha256
 
+# decode (grid-x/fr-decode): turns a flight recording into newline-delimited
+# JSON for Voyager's flight-recordings toolset, which pipes it into jq. Built
+# by the same script, also from a local checkout; it replaces a Python port of
+# the same binary format that Voyager used to carry.
+COPY bin/go-cve-rebuild/${TARGETARCH}/decode.gz /tmp/decode.gz
+COPY bin/go-cve-rebuild/${TARGETARCH}/decode.gz.sha256 /tmp/decode.gz.sha256
+RUN cd /tmp && sha256sum -c decode.gz.sha256 \
+    && gunzip /tmp/decode.gz && mv /tmp/decode /decode && chmod +x /decode \
+    && rm -f /tmp/decode.gz.sha256
+
 # buildkite CLI (bk) for CI/CD operations. Taken from the release tarball with
 # the upstream checksums file rather than Buildkite's apt repo (Debian-only) or
 # their .apk asset (which declares `provides: bk` on a package already named
@@ -186,6 +196,11 @@ RUN bk --version
 # when called with no recording, so the smoke test checks the usage line.
 COPY --from=builder /microwave /usr/local/bin/microwave
 RUN microwave 2>&1 | grep -q "Usage:"
+
+# Set up decode. Same as microwave: no --version, exits 2 on a bare call with
+# its usage on stderr, so the smoke test matches that line.
+COPY --from=builder /decode /usr/local/bin/decode
+RUN decode 2>&1 | grep -q "usage: decode"
 
 ARG AWS_DEFAULT_PROFILE
 ARG AWS_DEFAULT_REGION
