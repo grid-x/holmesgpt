@@ -59,6 +59,32 @@
 #   golang.org/x/text -> v0.42.0 on every binary (High, fixed 0.41.0;
 #   x/net v0.60.0 requires 0.42.0).
 #
+# Microwave: built AS-IS from a local checkout of the private grid-x/Microwave
+#   (MICROWAVE_SRC) -- no replaces, no re-vendor, just `go build`. This is the
+#   one tool here whose dependencies are NOT patched in this script, on purpose:
+#   it is a gridX-owned internal repo, so a dep bump belongs in Microwave's own
+#   go.mod rather than being pinned from here. Pinning it here would also force
+#   a `go mod tidy && go mod vendor` on every image build (Go refuses a replace
+#   that vendor/modules.txt does not record), turning an offline 7s build into a
+#   network-dependent 16s one and giving Microwave's module graph two sources of
+#   truth. Maintainability over a locally-patched binary -- a deliberate trade.
+#
+#   The GOTOOLCHAIN pin above still applies and is the one thing enforced here:
+#   Microwave's go.mod says `go 1.26.3`, which is below this file's stdlib
+#   floor, so building it with the pinned toolchain costs nothing and keeps the
+#   stdlib CVEs closed.
+#
+#   What that leaves open, stated plainly rather than waved off: at v1.10.0
+#   Microwave vendors x/net 0.55.0, x/text 0.37.0 and grpc 1.81.1, below the
+#   floors above. `x/net/http2`, `x/net/html` and grpc's `internal/transport`
+#   ARE linked into the binary (pulled in through grid-x/client's
+#   publisher/derapi packages, not by the CLI itself), so scanner findings on
+#   it are real rather than unreachable dead code. The practical exposure is
+#   small -- a CLI that reads a local file, with no listener and no untrusted
+#   peer -- and the fix is a dep bump in Microwave:
+#     go get golang.org/x/net@v0.60.0 golang.org/x/text@v0.42.0 \
+#            google.golang.org/grpc@v1.83.2 && go mod tidy && go mod vendor
+#
 # Known findings left in the image (no upstream fix exists):
 #   GO-2026-5932  (x/crypto/openpgp) — the package is unmaintained by design.
 #   Not reachable from any code path holmes uses; x/crypto has no release that
@@ -144,6 +170,18 @@ KUBECTL_VERSION=v1.37.1
 X_CRYPTO_PATCHED_VERSION=v0.56.0
 ORAS_GO_PATCHED_VERSION=v2.6.2
 MONGO_DRIVER_PATCHED_VERSION=v1.17.7
+# Microwave (grid-x, PRIVATE) reads gridX flight recordings. Built from a LOCAL
+# CHECKOUT, not a clone: the repo is private, so a clone would need credentials
+# on every build host. Point MICROWAVE_SRC at it.
+#
+# The build is fully offline and needs no credentials -- the repo vendors its
+# deps, including the private grid-x/client (verified with GOPROXY=off). Its
+# deps are deliberately NOT patched here; see the header for why.
+#
+# Not version-pinned, because a checkout is whatever you have checked out. The
+# build echoes `git describe` so the build log records what went in; keep the
+# checkout at a release tag unless you are deliberately testing newer work.
+MICROWAVE_SRC="${MICROWAVE_SRC:-$HOME/go/github.com/grid-x/Microwave}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 OUTDIR="$REPO_ROOT/bin/go-cve-rebuild"
@@ -238,9 +276,37 @@ for arch in amd64 arm64; do
     -o "$OUTDIR/$arch/kubectl" ./cmd/kubectl
 done
 
+# Microwave: built as-is from $MICROWAVE_SRC. No replaces and no re-vendor, so
+# unlike the three tools above this needs no network and does not touch the
+# checkout's go.mod -- `go build` reads the tree in place.
+if [ ! -d "$MICROWAVE_SRC" ]; then
+  echo "ERROR: MICROWAVE_SRC=$MICROWAVE_SRC is not a directory." >&2
+  echo "Clone the private repo grid-x/Microwave and set MICROWAVE_SRC to it." >&2
+  exit 1
+fi
+if [ ! -f "$MICROWAVE_SRC/cmd/microwave/microwave.go" ]; then
+  echo "ERROR: $MICROWAVE_SRC does not look like grid-x/Microwave (no cmd/microwave/microwave.go)." >&2
+  exit 1
+fi
+
+MICROWAVE_DESCRIBE="$(cd "$MICROWAVE_SRC" && git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+echo "==> Building Microwave from $MICROWAVE_SRC ($MICROWAVE_DESCRIBE)..."
+cd "$MICROWAVE_SRC"
+
+# -mod=vendor explicitly (not just inherited from the vendor/ dir being present)
+# and GOPROXY=off, so a dependency that is somehow missing from the vendored
+# tree fails the build loudly instead of being fetched -- which would make this
+# silently network-dependent again.
+for arch in amd64 arm64; do
+  echo "==> Building Microwave for linux/$arch..."
+  GOPROXY=off CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -mod=vendor \
+    -ldflags "-w -s" \
+    -o "$OUTDIR/$arch/microwave" ./cmd/microwave
+done
+
 echo "==> Compressing binaries..."
 for arch in amd64 arm64; do
-  for f in argocd helm kubectl; do
+  for f in argocd helm kubectl microwave; do
     gzip -f "$OUTDIR/$arch/$f"
   done
 done
@@ -253,7 +319,7 @@ else
   SHA256_CMD="shasum -a 256"
 fi
 for arch in amd64 arm64; do
-  (cd "$OUTDIR/$arch" && for f in argocd.gz helm.gz kubectl.gz; do
+  (cd "$OUTDIR/$arch" && for f in argocd.gz helm.gz kubectl.gz microwave.gz; do
     $SHA256_CMD "$f" > "$f.sha256"
   done)
 done

@@ -63,6 +63,16 @@ RUN cd /tmp && sha256sum -c helm.gz.sha256 \
     && gunzip /tmp/helm.gz && mv /tmp/helm /helm && chmod +x /helm \
     && rm -f /tmp/helm.gz.sha256
 
+# microwave: reads gridX flight recordings (private grid-x/Microwave). Built by
+# scripts/build_go_binaries.sh from a local checkout rather than downloaded --
+# the repo is private AND its own releases are built below this image's CVE
+# floors (see that script's header).
+COPY bin/go-cve-rebuild/${TARGETARCH}/microwave.gz /tmp/microwave.gz
+COPY bin/go-cve-rebuild/${TARGETARCH}/microwave.gz.sha256 /tmp/microwave.gz.sha256
+RUN cd /tmp && sha256sum -c microwave.gz.sha256 \
+    && gunzip /tmp/microwave.gz && mv /tmp/microwave /microwave && chmod +x /microwave \
+    && rm -f /tmp/microwave.gz.sha256
+
 # buildkite CLI (bk) for CI/CD operations. Taken from the release tarball with
 # the upstream checksums file rather than Buildkite's apt repo (Debian-only) or
 # their .apk asset (which declares `provides: bk` on a package already named
@@ -171,6 +181,11 @@ RUN helm version
 # Set up buildkite CLI
 COPY --from=builder /bk /usr/local/bin/bk
 RUN bk --version
+
+# Set up microwave. No --version flag: it prints usage to stderr and exits 1
+# when called with no recording, so the smoke test checks the usage line.
+COPY --from=builder /microwave /usr/local/bin/microwave
+RUN microwave 2>&1 | grep -q "Usage:"
 
 ARG AWS_DEFAULT_PROFILE
 ARG AWS_DEFAULT_REGION
