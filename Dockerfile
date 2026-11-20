@@ -97,6 +97,27 @@ RUN cd /tmp \
     && rm -f "bk_${BUILDKITE_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" "bk_${BUILDKITE_CLI_VERSION}_checksums.txt" \
     && /bk --version
 
+# clickhousectl for SQL on ClickHouse Cloud services via the Query API, which
+# authenticates with a Cloud API key (CLICKHOUSE_CLOUD_API_KEY/_SECRET) instead
+# of a database user per service. Static musl binary from the release tarball,
+# checked against the upstream SHA256SUMS like bk above. Assets are named by
+# Rust target triple, so TARGETARCH (amd64/arm64) has to be mapped.
+ARG CLICKHOUSECTL_VERSION=0.6.0
+RUN case "${TARGETARCH}" in \
+    amd64) CHCTL_ARCH=x86_64 ;; \
+    arm64) CHCTL_ARCH=aarch64 ;; \
+    *) echo "unsupported TARGETARCH for clickhousectl: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && CHCTL_NAME="clickhousectl-${CHCTL_ARCH}-unknown-linux-musl-v${CLICKHOUSECTL_VERSION}" \
+    && cd /tmp \
+    && curl -fsSL -O "https://github.com/ClickHouse/clickhousectl/releases/download/v${CLICKHOUSECTL_VERSION}/${CHCTL_NAME}.tar.gz" \
+    && curl -fsSL -O "https://github.com/ClickHouse/clickhousectl/releases/download/v${CLICKHOUSECTL_VERSION}/SHA256SUMS" \
+    && grep " ${CHCTL_NAME}.tar.gz\$" SHA256SUMS | sha256sum -c - \
+    && tar xzf "${CHCTL_NAME}.tar.gz" --strip-components=1 -C / "${CHCTL_NAME}/clickhousectl" \
+    && chmod +x /clickhousectl \
+    && rm -f "${CHCTL_NAME}.tar.gz" SHA256SUMS \
+    && DO_NOT_TRACK=1 CLICKHOUSECTL_NO_UPDATE_CHECK=1 /clickhousectl --version
+
 # Set up poetry
 ARG PRIVATE_PACKAGE_REGISTRY="none"
 RUN if [ "${PRIVATE_PACKAGE_REGISTRY}" != "none" ]; then \
@@ -191,6 +212,15 @@ RUN helm version
 # Set up buildkite CLI
 COPY --from=builder /bk /usr/local/bin/bk
 RUN bk --version
+
+# Set up clickhousectl. By default it prints a telemetry notice to stderr on
+# first run, sends anonymous usage data, and checks GitHub for updates -- all
+# noise in a tool result the model has to read, from a pod with no use for
+# them. The opt-outs are set image-wide so every bash tool call inherits them.
+ENV DO_NOT_TRACK=1
+ENV CLICKHOUSECTL_NO_UPDATE_CHECK=1
+COPY --from=builder /clickhousectl /usr/local/bin/clickhousectl
+RUN clickhousectl --version
 
 # Set up microwave. No --version flag: it prints usage to stderr and exits 1
 # when called with no recording, so the smoke test checks the usage line.

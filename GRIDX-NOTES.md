@@ -18,6 +18,7 @@ Rebased from `fix/bash-argv-flag-aware-validation` (which sat on 0.42.0).
 | `fix(jq): stop reporting a data error as an invalid jq expression` | see below |
 | `chore: add microwave to the image for flight recordings` | see below |
 | `chore: add fr-decode, raise the Go toolchain pin to 1.27.3` | see below |
+| `chore: add clickhousectl to the image for ClickHouse Cloud queries` | see below |
 
 `json_filter_mixin._apply_jq_filter` labelled every failure "Invalid jq
 expression", including failures where the filter compiled fine and the DATA was
@@ -137,6 +138,35 @@ script documents, and all three externals were verified to compile on 1.27.3),
 but **the next run of the script will rebuild all five on 1.27.3**, which is
 when the tree catches up. Do not read the committed binaries as evidence of
 what the pin produces until then.
+
+## clickhousectl in the image
+
+`clickhousectl` (ClickHouse's official CLI) is how Voyager queries ClickHouse
+Cloud: `cloud clickhouse query` sends one SQL statement to a service's Query API
+endpoint, authenticated with a single Cloud API key
+(`CLICKHOUSE_CLOUD_API_KEY`/`_SECRET`) instead of a database user per service,
+and run as whatever database role that endpoint grants (`sql_console_read_only`
+for Voyager). It replaces Voyager's previous ClickHouse path through Grafana's
+`query_sql`. Voyager uses it like `psql`: a bash allowlist prefix plus a prompt
+section, no toolset code here.
+
+Not built by `scripts/build_go_binaries.sh` — it is Rust, not Go, and none of
+that script's CVE replaces apply. Taken from the upstream release tarball and
+checked against the release's `SHA256SUMS`, the same way `bk` is. The release
+assets are named by Rust target triple (`x86_64`/`aarch64-unknown-linux-musl`),
+so the stanza maps `TARGETARCH`; both are static-pie binaries and need nothing
+from Alpine.
+
+`DO_NOT_TRACK=1` and `CLICKHOUSECTL_NO_UPDATE_CHECK=1` are set image-wide.
+Without them it sends anonymous usage telemetry, checks GitHub for updates, and
+prints a multi-line telemetry notice to stderr on first run — which the bash
+toolset would hand to the model as part of a tool result.
+
+Verified: the two stanzas, extracted into a minimal `python:3.11-alpine`
+Dockerfile, build and smoke-test on both `linux/amd64` and `linux/arm64`
+(`clickhousectl 0.6.0`; with no credentials a query exits with a clean
+`auth_required` error, nothing else written). Not yet verified in a full image
+build from this branch, like the rest of the Dockerfile commits.
 
 ## Why the two bash commits were not replayed
 
